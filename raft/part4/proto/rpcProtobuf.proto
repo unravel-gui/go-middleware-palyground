@@ -1,0 +1,17 @@
+syntax = "proto2";
+option go_package = "../proto";
+
+package proto;
+
+
+message RequestVoteArgs {
+	required int64 Term = 1;
+	required int64 CandidateId = 2;
+	required int64 LastLogIndex = 3;
+	required int64 LastLogTerm = 4;
+}
+
+message RequestVoteReply {
+	required int64 Term = 1;
+	required bool VoteGranted = 2;
+}

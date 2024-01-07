@@ -7,7 +7,6 @@ import (
 	"log"
 	"math/rand"
 	"os"
-	"raft/part4/proto"
 	"sync"
 	"time"
 )
@@ -209,22 +208,22 @@ func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
 	}
 }
 
-//// proto.RequestVoteArgs 拉票请求
-//type proto.RequestVoteArgs struct {
-//	Term         int // 请求方任期
-//	CandidateId  int // 候选人Id(请求方)
-//	LastLogIndex int // 请求方最新的日志索引
-//	LastLogTerm  int // 请求方最新的日志任期
-//}
-//
-//// proto.RequestVoteReply 拉票响应
-//type proto.RequestVoteReply struct {
-//	Term        int  // 响应方任期
-//	VoteGranted bool // 是否同意投票
-//}
+// RequestVoteArgs 拉票请求
+type RequestVoteArgs struct {
+	Term         int // 请求方任期
+	CandidateId  int // 候选人Id(请求方)
+	LastLogIndex int // 请求方最新的日志索引
+	LastLogTerm  int // 请求方最新的日志任期
+}
+
+// RequestVoteReply 拉票响应
+type RequestVoteReply struct {
+	Term        int  // 响应方任期
+	VoteGranted bool // 是否同意投票
+}
 
 // RequestVote 处理投票逻辑
-func (cm *ConsensusModule) RequestVote(args proto.RequestVoteArgs, reply *proto.RequestVoteReply) error {
+func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	// 节点死亡无需处理
@@ -235,34 +234,28 @@ func (cm *ConsensusModule) RequestVote(args proto.RequestVoteArgs, reply *proto.
 	lastLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
 	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
 	// 对方任期更高，成为Follower,会更新任期，投票等信息
-	argsTerm := int(*args.Term)
-	argsCandidateId := int(*args.CandidateId)
-	argsLastLogTerm := int(*args.LastLogTerm)
-	argsLastLogIndex := int(*args.LastLogIndex)
-	if argsTerm > cm.currentTerm {
+	if args.Term > cm.currentTerm {
 		cm.dlog("... term out of date in RequestVote")
-		cm.becomeFollower(argsTerm)
+		cm.becomeFollower(args.Term)
 	}
-	var voteGranted bool
-	if cm.currentTerm == argsTerm && // 任期相同
-		(cm.votedFor == -1 || cm.votedFor == argsCandidateId) && // 未投票或投票对象是拉票节点
-		(argsLastLogTerm > lastLogTerm || // 对方任期更新，表明数据更新
-			(argsLastLogTerm == lastLogTerm && argsLastLogIndex >= lastLogIndex)) { // 任期相同，对方日志索引更大，表示数据更新
+
+	if cm.currentTerm == args.Term && // 任期相同
+		(cm.votedFor == -1 || cm.votedFor == args.CandidateId) && // 未投票或投票对象是拉票节点
+		(args.LastLogTerm > lastLogTerm || // 对方任期更新，表明数据更新
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)) { // 任期相同，对方日志索引更大，表示数据更新
 		// 同意投票
-		voteGranted = true
+		reply.VoteGranted = true
 		// 更新投票对象
-		cm.votedFor = argsCandidateId
+		cm.votedFor = args.CandidateId
 		// 更新选举时间，此时也是收到选举的远程调度请求，所以需要更新这个选举时间
 		cm.electionResetEvent = time.Now()
 	} else {
 		// 不满足条件，对方数据状态还没当前节点新
 		// 不同意
-		voteGranted = false
+		reply.VoteGranted = false
 	}
 	// 返回当前的节点的任期，如果当前节点的任期更高则可以帮助对方成为Follower
-	reply.VoteGranted = &voteGranted
-	currentTerm := int64(cm.currentTerm)
-	reply.Term = &currentTerm
+	reply.Term = cm.currentTerm
 	// 持久化内存中的log
 	cm.persistToStorage()
 	cm.dlog("... RequestVote reply: %+v", reply)
@@ -450,40 +443,35 @@ func (cm *ConsensusModule) startElection() {
 			// 获得自己的记录状态
 			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
 			cm.mu.Unlock()
-			currentTerm := int64(savedCurrentTerm)
-			candidateId := int64(cm.id)
-			lastLogTerm := int64(savedLastLogTerm)
-			lastLogIndex := int64(savedLastLogIndex)
 			// 包装请求
-			args := proto.RequestVoteArgs{
-				Term:         &currentTerm,
-				CandidateId:  &candidateId,
-				LastLogIndex: &lastLogIndex,
-				LastLogTerm:  &lastLogTerm,
+			args := RequestVoteArgs{
+				Term:         savedCurrentTerm,
+				CandidateId:  cm.id,
+				LastLogIndex: savedLastLogIndex,
+				LastLogTerm:  savedLastLogTerm,
 			}
 
 			cm.dlog("sending RequestVote to %d: %+v", peerId, args)
 
-			var reply proto.RequestVoteReply
+			var reply RequestVoteReply
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				// 成功获得返回的处理逻辑
 
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.dlog("received proto.RequestVoteReply %+v", reply)
+				cm.dlog("received RequestVoteReply %+v", reply)
 				// 判断当期节点是否还是Candidate，可能会被其他协程改变，如果不是则不需要走下面的逻辑
 				if cm.state != Candidate {
 					cm.dlog("while waiting for reply, state = %v", cm.state)
 					return
 				}
-				replyTerm := int(*reply.Term)
 				// 对方任期更大，表示对方数据更新，当前节点不可能当选Leader，转为Follower节点
-				if replyTerm > cm.currentTerm {
-					cm.dlog("term out of date in proto.RequestVoteReply")
-					cm.becomeFollower(replyTerm)
+				if reply.Term > cm.currentTerm {
+					cm.dlog("term out of date in RequestVoteReply")
+					cm.becomeFollower(reply.Term)
 					return
-				} else if replyTerm == savedCurrentTerm { // 任期相同
-					if *reply.VoteGranted { // 成功拉到票
+				} else if reply.Term == savedCurrentTerm { // 任期相同
+					if reply.VoteGranted { // 成功拉到票
 						// 票数+1
 						voteReceived += 1
 						// 大多数同意则成为Leader
