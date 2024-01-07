@@ -1,4 +1,4 @@
-package part3
+package part4
 
 import (
 	"bytes"
@@ -459,7 +459,7 @@ func (cm *ConsensusModule) startElection() {
 
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.dlog("received RequestVoteReply %+v", reply)
+				cm.dlog("received proto.RequestVoteReply %+v", reply)
 				// 判断当期节点是否还是Candidate，可能会被其他协程改变，如果不是则不需要走下面的逻辑
 				if cm.state != Candidate {
 					cm.dlog("while waiting for reply, state = %v", cm.state)
@@ -467,7 +467,7 @@ func (cm *ConsensusModule) startElection() {
 				}
 				// 对方任期更大，表示对方数据更新，当前节点不可能当选Leader，转为Follower节点
 				if reply.Term > cm.currentTerm {
-					cm.dlog("term out of date in RequestVoteReply")
+					cm.dlog("term out of date in proto.RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == savedCurrentTerm { // 任期相同

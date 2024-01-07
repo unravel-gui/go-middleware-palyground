@@ -1,7 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-set "logfile=E:\\temp\\part4\rlog"
+set "logfile=E:\\temp\\part3\rlog"
 
 go test -v -race -run $args 2>&1 >> %logfile%
 

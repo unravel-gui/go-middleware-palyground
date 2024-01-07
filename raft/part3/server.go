@@ -7,7 +7,6 @@ import (
 	"net"
 	"net/rpc"
 	"os"
-	"raft/part4/proto"
 	"sync"
 	"time"
 )
@@ -175,7 +174,7 @@ type RPCProxy struct {
 
 // RequestVote 处理拉票请求
 // 在封装一层用于模拟网络不稳定的情况
-func (rpp *RPCProxy) RequestVote(args proto.RequestVoteArgs, reply *proto.RequestVoteReply) error {
+func (rpp *RPCProxy) RequestVote(args RequestVoteArgs, reply *RequestVoteReply) error {
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
 		if dice == 9 {
