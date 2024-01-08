@@ -41,7 +41,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	ready := make(chan interface{})
 	storage := make([]*MapStorage, n)
 
-	basePath := "disk/" + strconv.Itoa(time.Now().Second()) + "/"
+	basePath := "disk/" + strconv.FormatInt(time.Now().UnixNano(), 10) + "/"
 	// 初始化每个节点的内容
 	for i := 0; i < n; i++ {
 		// 计算当前节点的其他节点列表
