@@ -61,9 +61,9 @@ type ConsensusModule struct {
 	storage    Storage            // 存储对象
 	commitChan chan<- CommitEntry // 用于传输已提交数据的通道
 
-	newCommitReadyChan chan struct{} // 用于通知数据已准备好提交
-
-	triggerAEChan chan struct{} // 用于触发同步日志操作
+	newCommitReadyChan   chan struct{} // 用于通知数据已准备好提交
+	persistenceReadyChan chan struct{} // 用于触发持久化
+	triggerAEChan        chan struct{} // 用于触发同步日志操作
 
 	currentTerm int        // 当前任期
 	votedFor    int        // 投票对象
@@ -76,6 +76,10 @@ type ConsensusModule struct {
 
 	nextIndex  map[int]int // 下一个需要同步的日志索引
 	matchIndex map[int]int // 已同步的日志索引
+
+	commandMap   map[string]interface{} // 保存数据
+	ac           *AtomicCounter         // 触发快照
+	persistIndex int                    // 标记持久化的日志索引
 }
 
 func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
@@ -93,6 +97,9 @@ func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, 
 	cm.lastApplied = -1
 	cm.nextIndex = make(map[int]int)
 	cm.matchIndex = make(map[int]int)
+	cm.persistIndex = -1
+	cm.commandMap = make(map[string]interface{})
+	cm.ac = NewAtomicCounter(5)
 
 	if cm.storage.HasData() {
 		cm.restoreFromStorage()
@@ -154,33 +161,65 @@ func (cm *ConsensusModule) Stop() {
 
 // 从存储中加载数据,包含currentTerm、voteFor、log
 func (cm *ConsensusModule) restoreFromStorage() {
-	if termData, found := cm.storage.Get("currentTerm"); found {
-		d := gob.NewDecoder(bytes.NewReader(termData))
-		if err := d.Decode(&cm.currentTerm); err != nil {
-			log.Fatal(err)
+	if exist := cm.storage.restoreFromFile(); exist {
+		if termData, found := cm.storage.Get("currentTerm"); found {
+			d := gob.NewDecoder(bytes.NewReader(termData))
+			if err := d.Decode(&cm.currentTerm); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			log.Printf("currentTerm not found in storage")
 		}
-	} else {
-		log.Fatal("currentTerm not found in storage")
+		if voteData, found := cm.storage.Get("votedFor"); found {
+			d := gob.NewDecoder(bytes.NewBuffer(voteData))
+			if err := d.Decode(&cm.votedFor); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			log.Printf("votedFor not found in storage")
+		}
+		if logData, found := cm.storage.Get("log"); found {
+			d := gob.NewDecoder(bytes.NewBuffer(logData))
+			if err := d.Decode(&cm.log); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			log.Printf("log not found in storage")
+		}
+
+		if acData, found := cm.storage.Get("ac"); found {
+			d := gob.NewDecoder(bytes.NewBuffer(acData))
+			var value int64
+			if err := d.Decode(&value); err != nil {
+				log.Fatal(err)
+			}
+			cm.ac.SetValue(value)
+		} else {
+			log.Printf("ac not found in storage")
+		}
+		if persistIndexData, found := cm.storage.Get("persistIndex"); found {
+			d := gob.NewDecoder(bytes.NewBuffer(persistIndexData))
+			if err := d.Decode(&cm.persistIndex); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			log.Printf("persistIndex not found in storage")
+		}
 	}
-	if voteData, found := cm.storage.Get("votedFor"); found {
-		d := gob.NewDecoder(bytes.NewBuffer(voteData))
-		if err := d.Decode(&cm.votedFor); err != nil {
+
+	// 读取快照数据
+	if commandData := cm.storage.getSnapShot(); commandData != nil {
+		d := gob.NewDecoder(bytes.NewBuffer(commandData))
+		if err := d.Decode(&cm.commandMap); err != nil {
 			log.Fatal(err)
 		}
 	} else {
-		log.Fatal("votedFor not found in storage")
-	}
-	if logData, found := cm.storage.Get("log"); found {
-		d := gob.NewDecoder(bytes.NewBuffer(logData))
-		if err := d.Decode(&cm.log); err != nil {
-			log.Fatal(err)
-		}
-	} else {
-		log.Fatal("log not found in storage")
+		log.Printf("commandMap not found in storage")
 	}
 }
 
 // 持久化内存数据,包含currentTerm、voteFor、log
+// 由外部调用的函数获得锁
 func (cm *ConsensusModule) persistToStorage() {
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
@@ -199,6 +238,34 @@ func (cm *ConsensusModule) persistToStorage() {
 		log.Fatal(err)
 	}
 	cm.storage.Set("log", logData.Bytes())
+
+	var acData bytes.Buffer
+	if err := gob.NewEncoder(&acData).Encode(cm.ac.Value()); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("ac", acData.Bytes())
+
+	var persistIndexData bytes.Buffer
+	if err := gob.NewEncoder(&persistIndexData).Encode(cm.persistIndex); err != nil {
+		log.Fatal(err)
+	}
+	cm.storage.Set("persistIndex", persistIndexData.Bytes())
+
+	// 开协程去落盘
+	go func() {
+		cm.storage.PersistToFile()
+	}()
+}
+
+func (cm *ConsensusModule) snapShot() {
+	var commandData bytes.Buffer
+	if err := gob.NewEncoder(&commandData).Encode(cm.commandMap); err != nil {
+		log.Fatal(err)
+	}
+	// 开协程去落盘
+	go func() {
+		cm.storage.SnapShot(commandData.Bytes())
+	}()
 }
 
 func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
@@ -720,6 +787,13 @@ func (cm *ConsensusModule) commitChanSender() {
 		}
 	}
 	cm.dlog("commitChanSender done")
+}
+
+func (cm *ConsensusModule) PersistenceMap() {
+	// 触发持久化
+	for range cm.persistenceReadyChan {
+	}
+	cm.dlog("PersistenceMap done")
 }
 
 func min(a, b int) int {

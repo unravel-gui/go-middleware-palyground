@@ -2,6 +2,7 @@ package part4
 
 import (
 	"log"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -40,6 +41,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	ready := make(chan interface{})
 	storage := make([]*MapStorage, n)
 
+	basePath := "disk/" + strconv.Itoa(time.Now().Second()) + "/"
 	// 初始化每个节点的内容
 	for i := 0; i < n; i++ {
 		// 计算当前节点的其他节点列表
@@ -49,8 +51,11 @@ func NewHarness(t *testing.T, n int) *Harness {
 				peerIds = append(peerIds, p)
 			}
 		}
-
-		storage[i] = NewMapStorage()
+		path := basePath + strconv.Itoa(i) + "/"
+		persistReadyChan := make(chan struct{})
+		runningFilename := path + "running-snapShot"
+		snapShotFilename := path + "data-snapShot" + strconv.Itoa(i)
+		storage[i] = NewMapStorage(runningFilename, snapShotFilename, persistReadyChan)
 		commitChans[i] = make(chan CommitEntry)
 		// 新建raft服务器
 		ns[i] = NewServer(i, peerIds, storage[i], ready, commitChans[i])

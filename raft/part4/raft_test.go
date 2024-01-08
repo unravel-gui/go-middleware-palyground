@@ -355,7 +355,7 @@ func TestDisconnectLeaderBriefly(t *testing.T) {
 	// Leader节点重联
 	h.DisconnectPeer(origLeaderId)
 	// 小于超时时间不会重选Leader节点
-	sleepMs(90)
+	sleepMs(80)
 	h.ReconnectPeer(origLeaderId)
 	sleepMs(200)
 	// 提交数据给旧Leader节点
