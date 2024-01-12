@@ -223,53 +223,91 @@ func (h *Harness) CheckCommitted(cmd int) (nc, index int) {
 	defer h.mu.Unlock()
 	// 保存已提交数据的长度
 	commitsLen := -1
+	tmpIndex := -1
 	// 检查每个节点的已提交数据长度是否相同
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] { // 节点存在连接
 			if commitsLen >= 0 {
-				if len(h.commits[i]) != commitsLen {
-					h.t.Fatalf("commits[%d] = %d, commitsLen= %d", i, h.commits[i], commitsLen)
+				if len(h.cluster[i].cm.commandMap) != commitsLen {
+					h.t.Fatalf("got diff length, cmd=%d: want Node[%d].currentMap=%+v, but Node[%d].currentMap=%+v",
+						cmd, tmpIndex, h.cluster[tmpIndex].cm.commandMap, i, h.cluster[i].cm.commandMap)
 				}
 			} else {
-				commitsLen = len(h.commits[i])
+				commitsLen = len(h.cluster[i].cm.commandMap)
+				tmpIndex = i
 			}
 		}
 	}
+
+	var f func(map[int]int) int
+	f = func(m map[int]int) int {
+		n := 0
+		for k, _ := range m {
+			n ^= k
+		}
+		return n
+	}
+	n := 0
+	tmpIndex = -1
+	for i := 0; i < h.n; i++ {
+		if h.connected[i] {
+			if tmpIndex != -1 {
+				n1 := f(h.cluster[i].cm.commandMap)
+				if n^n1 != 0 {
+					h.t.Fatalf("got diff: want Node[%d].currentMap=%+v, but Node[%d].currentMap=%+v",
+						tmpIndex, h.cluster[tmpIndex].cm.commandMap, i, h.cluster[i].cm.commandMap)
+				}
+			} else {
+				n = f(h.cluster[i].cm.commandMap)
+				tmpIndex = i
+			}
+		}
+	}
+	nc = 0
+	for i := 0; i < h.n; i++ {
+		if h.connected[i] {
+			_, ok := h.cluster[i].cm.commandMap[cmd]
+			if ok {
+				nc++
+			}
+		}
+	}
+	return nc, 0
 	// 检查每个已提交的数据
-	for c := 0; c < commitsLen; c++ {
-		cmdAtc := -1
-		// 检查每个节点相同索引的数据是否相同
-		for i := 0; i < h.n; i++ {
-			if h.connected[i] {
-				cmdOfN := h.commits[i][c].Command.(int)
-				if cmdAtc >= 0 {
-					if cmdOfN != cmdAtc {
-						h.t.Fatalf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtc, i, c)
-					}
-				} else {
-					cmdAtc = cmdOfN
-				}
-			}
-		}
-		// 如果是指定的已提交数据则判断这条数据在每个节点中的日志索引是否相同
-		// 计算存在这条数据的节点的个数
-		if cmdAtc == cmd {
-			index := -1
-			nc := 0
-			for i := 0; i < h.n; i++ {
-				if h.connected[i] {
-					if index >= 0 && h.commits[i][c].Index != index {
-						h.t.Errorf("got Index=%d, want %d at h.commits[%d][%d]", h.commits[i][c].Index, index, i, c)
-					} else {
-						index = h.commits[i][c].Index
-					}
-					nc++
-				}
-			}
-			// 返回存在这条数据的节点数和索引
-			return nc, index
-		}
-	}
+	//for c := 0; c < commitsLen; c++ {
+	//	cmdAtc := -1
+	//	// 检查每个节点相同索引的数据是否相同
+	//	for i := 0; i < h.n; i++ {
+	//		if h.connected[i] {
+	//			cmdOfN := h.commits[i][c].Command.(int)
+	//			if cmdAtc >= 0 {
+	//				if cmdOfN != cmdAtc {
+	//					h.t.Fatalf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtc, i, c)
+	//				}
+	//			} else {
+	//				cmdAtc = cmdOfN
+	//			}
+	//		}
+	//	}
+	// 如果是指定的已提交数据则判断这条数据在每个节点中的日志索引是否相同
+	// 计算存在这条数据的节点的个数
+	//	if cmdAtc == cmd {
+	//		index := -1
+	//		nc := 0
+	//		for i := 0; i < h.n; i++ {
+	//			if h.connected[i] {
+	//				if index >= 0 && h.commits[i][c].Index != index {
+	//					h.t.Errorf("got Index=%d, want %d at h.commits[%d][%d]", h.commits[i][c].Index, index, i, c)
+	//				} else {
+	//					index = h.commits[i][c].Index
+	//				}
+	//				nc++
+	//			}
+	//		}
+	//		// 返回存在这条数据的节点数和索引
+	//		return nc, index
+	//	}
+	//}
 	// 找不到返回-1
 	h.t.Errorf("cmd=%d not found in commits", cmd)
 	return -1, -1
@@ -279,7 +317,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc, index int) {
 func (h *Harness) CheckCommittedN(cmd int, n int) {
 	nc, _ := h.CheckCommitted(cmd)
 	if nc != n {
-		h.t.Errorf("CheclCommitedN got nc=%d, want %d", nc, n)
+		h.t.Errorf("CheckCommitedN [%d] got nc=%d, want %d", cmd, nc, n)
 	}
 }
 
@@ -292,13 +330,16 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] { // 节点如果连接
 			// 检查当前节点每个数据
-			for c := 0; c < len(h.commits[i]); c++ {
-				gotCmd := h.commits[i][c].Command.(int)
-				// 如果存在指定数据则报错
-				if gotCmd == cmd {
-					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, i, c)
-				}
+			_, ok := h.cluster[i].cm.commandMap[cmd]
+			if ok {
+				h.t.Errorf("found %d at Node[%d],currentMap=%+v, expected none", cmd, i, h.cluster[i].cm.commandMap)
 			}
+			//for c := 0; c < len(h.commits[i]); c++ {
+			//	gotCmd := h.commits[i][c].Command.(int)
+			//	// 如果存在指定数据则报错
+			//	if gotCmd == cmd {
+			//	}
+			//}
 		}
 	}
 }

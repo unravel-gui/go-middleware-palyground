@@ -56,24 +56,23 @@ func (ms *MapStorage) restoreFromFile() bool {
 	// 读取运行数据
 	if fileExists(ms.runningFilename) {
 		// 文件存在
-		file, err := os.Create(ms.runningFilename)
+		file, err := os.Open(ms.runningFilename)
 		if err != nil {
 			log.Fatal(err)
 			return false
 		}
+		defer file.Close()
 		decoder := gob.NewDecoder(file)
 		var snapShot SnapShot
 		err = decoder.Decode(&snapShot)
-		if err != nil {
-			if err == io.EOF {
-				// 正常情况，文件已经读取完毕
-				return true
-			}
+		if err != nil && err != io.EOF {
 			log.Fatalf("restoreFromFile Error decoding:%v", err)
 			return false
 		}
 		// 将持久化的数据给到ms
-		ms.m = snapShot.M
+		if snapShot.M != nil {
+			ms.m = snapShot.M
+		}
 		return true
 	} else {
 		return false
@@ -93,6 +92,7 @@ func (ms *MapStorage) PersistToFile() {
 		log.Fatalf("Running-SnapShot Error:%+v", err)
 		return
 	}
+	defer file.Close()
 	snapShot := SnapShot{
 		M: ms.m,
 	}
@@ -102,46 +102,54 @@ func (ms *MapStorage) PersistToFile() {
 }
 
 func (ms *MapStorage) getSnapShot() []byte {
+	ms.mu.Lock()
+	snapShotFilename := ms.snapShotFilename
+	ms.mu.Unlock()
 	// 读取持久化数据
-	_, err := os.Stat(ms.snapShotFilename)
-	if err == nil {
+	if fileExists(snapShotFilename) {
 		// 文件存在
-		file, err := os.Create(ms.runningFilename)
+		file, err := os.Open(snapShotFilename)
 		if err != nil {
 			log.Fatal(err)
 			return nil
 		}
+		defer file.Close()
 		decoder := gob.NewDecoder(file)
 		var snapShot SnapShot
 		err = decoder.Decode(&snapShot)
-		if err != nil {
-			log.Fatalf("restoreFromFile Error decoding:%v", err)
+		if err != nil && err != io.EOF {
+			log.Fatalf("getSnapShot Error decoding:%v", err)
 			return nil
 		}
+		fmt.Printf("load snapShot=%+v, from [%v] \n", snapShot, ms.snapShotFilename)
 		return snapShot.Command
 	}
 	return nil
 }
 
 func (ms *MapStorage) SnapShot(command []byte) {
-	for range ms.persistReadyChan {
-		go func() {
-			// 触发持久化
-			ms.mu.Lock()
-			defer ms.mu.Unlock()
-			file, err := os.Create(ms.snapShotFilename)
-			if err != nil {
-				log.Fatalf("SnapShot Error:%+v", err)
-				return
-			}
-			snapShot := SnapShot{
-				Command: command,
-			}
-			if err = gob.NewEncoder(file).Encode(snapShot); err != nil {
-				log.Fatalf("SnapShot Error:%+v", err)
-			}
-		}()
+	// 触发持久化
+	ms.mu.Lock()
+	snapShotFilename := ms.snapShotFilename
+	ms.mu.Unlock()
+	if err := os.MkdirAll(filepath.Dir(snapShotFilename), 0755); err != nil {
+		fmt.Println("Error creating directories:", err)
+		return
 	}
+	file, err := os.Create(snapShotFilename)
+	if err != nil {
+		log.Fatalf("SnapShot Error:%+v", err)
+		return
+	}
+	defer file.Close()
+	snapShot := SnapShot{
+		Command: command,
+	}
+	if err = gob.NewEncoder(file).Encode(snapShot); err != nil {
+		log.Fatalf("SnapShot Error:%+v", err)
+	}
+
+	fmt.Printf("dump snapShot=%+v\n to [%+v]", snapShot, ms.snapShotFilename)
 }
 
 // Get 获得数据
@@ -165,7 +173,7 @@ func (ms *MapStorage) Set(key string, value []byte) {
 func (ms *MapStorage) HasData() bool {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
-	return len(ms.m) > 0
+	return len(ms.m) > 0 || fileExists(ms.runningFilename)
 }
 
 func fileExists(filePath string) bool {
