@@ -173,6 +173,7 @@ func (cm *ConsensusModule) Stop() {
 	close(cm.newCommitReadyChan)
 	close(cm.persistenceReadyChan)
 	close(cm.triggerAEChan)
+	cm.dlog("close channel of 2 ready and 1 trigger")
 }
 
 // 从存储中加载数据,包含currentTerm、voteFor、log
@@ -414,7 +415,6 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	}
 	reply.Success = false
 
-	//TODO: 全量复制
 	if args.Ac != -1 {
 		cm.dlog("Full AppendEntries from [%+v], args=%+v", args.LeaderId, args)
 		cm.FullReplication(args, reply)
@@ -439,7 +439,6 @@ func (cm *ConsensusModule) IncrementalReplication(args AppendEntriesArgs, reply 
 		currentPreLogIndex := cm.getCurrentLogIndex(args.PrevTotalLogIndex)
 		cm.dlog("Args for Append Logs from [%v]: [args=%+v, totalLogLength=%v,currentPreLogIndex=%v,log=%+v, persistIndex=%v,lastLogTerm=%v]",
 			args.LeaderId, args, totalLogLength, currentPreLogIndex, cm.log, cm.persistIndex, cm.lastLogTerm)
-		//TODO:优化成case
 		if (args.PrevTotalLogIndex == -1 && args.LeaderTotalCommit == -1) || // 第一次同步
 			currentPreLogIndex == -1 || // 相对索引为-1，对应Follower节点持久化后第一次同步的情况
 			(args.PrevLogTerm == -1 && args.LastLogTerm == cm.lastLogTerm && args.PersistIndex+len(args.Entries)+1 == totalLogLength) || // PreLogTerm=-1说明这部分日志在Leader中已经被丢弃，这里只需要判断是否是提交请求即可,
@@ -472,7 +471,6 @@ func (cm *ConsensusModule) IncrementalReplication(args AppendEntriesArgs, reply 
 			if newEntriesIndex < len(args.Entries) {
 				cm.dlog("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				// 插入数据
-				// TODO:BUG
 				cm.log = append(cm.log[:logInsertIndex], args.Entries[newEntriesIndex:]...)
 				cm.lastLogTerm = args.LastLogTerm
 				cm.dlog("... log is now: %v", cm.log)
@@ -497,28 +495,29 @@ func (cm *ConsensusModule) IncrementalReplication(args AppendEntriesArgs, reply 
 			if args.PrevTotalLogIndex >= totalLogLength || // 总日志中上一次提交的绝对索引比当前总日志长度都要大肯定存在数据丢失
 				currentPreLogIndex < 0 || currentPreLogIndex >= len(cm.log) || (args.PrevLogTerm == -1 && args.LastLogTerm != cm.lastLogTerm) { // 计算出当前日志中对应的索引不在相对日志的范围内,代表当前节点丢失持久化部分的数据，直接全量同步同步
 				// 丢失数据索引开始的位置,绝对索引
-				reply.ConflictIndex = currentPreLogIndex
+				//reply.ConflictIndex = currentPreLogIndex
+				reply.ConflictIndex = cm.persistIndex + 1
 				// 数据丢失，与任期无关
 				reply.ConflictTerm = -1
 			} else { // 接收方可以增量复制，计算增量复制需要的信息
 				// 这里的情况是任期不符合的情况，即存在数据冲突
 				// 出现问题的任期
 				reply.ConflictTerm = cm.log[currentPreLogIndex].Term
-				if cm.log[currentPreLogIndex].Term == -1 {
-					reply.ConflictIndex = cm.persistIndex + 1
-				} else {
-					var i int
-					// 从后向前找到问题任期的第一个位置
-					// 这里由于我们只有将提交成功的日志进行持久化，所以已经持久化的日志必定是正确的，唯一存在的数据丢失问题则由全量复制解决
-					for i = currentPreLogIndex - 1; i >= 0; i-- {
-						if cm.log[i].Term != reply.ConflictTerm {
-							break
-						}
+				//if cm.log[currentPreLogIndex].Term == -1 {
+				//	reply.ConflictIndex = cm.persistIndex + 1
+				//} else {
+				var i int
+				// 从后向前找到问题任期的第一个位置
+				// 这里由于我们只有将提交成功的日志进行持久化，所以已经持久化的日志必定是正确的，唯一存在的数据丢失问题则由全量复制解决
+				for i = currentPreLogIndex - 1; i >= 0; i-- {
+					if cm.log[i].Term != reply.ConflictTerm {
+						break
 					}
-					// 记录出现冲突任期的第一个索引位置，也就是脏数据的第一位
-					// 使用绝对索引
-					reply.ConflictIndex = cm.getTotalLogIndex(i + 1)
 				}
+				// 记录出现冲突任期的第一个索引位置，也就是脏数据的第一位
+				// 使用绝对索引
+				reply.ConflictIndex = cm.getTotalLogIndex(i + 1)
+				//}
 			}
 		}
 	}
@@ -551,10 +550,8 @@ func (cm *ConsensusModule) FullReplication(args AppendEntriesArgs, reply *Append
 		cm.lastApplied = args.PersistIndex
 		cm.lastLogTerm = args.LastLogTerm
 		cm.ac.SetValue(int64(args.Ac))
-		if len(args.Entries) > 0 {
-			cm.log = args.Entries
-			cm.dlog("... Full inserting entries log=%+v", cm.log)
-		}
+		cm.log = args.Entries
+		cm.dlog("... Full inserting entries log=%+v", cm.log)
 		cm.dlog("AppendEntries Full Commit to [%v]: LeaderCommit=%+v, FollowerCommit=%+v", args.LeaderId, args.LeaderTotalCommit, cm.commitIndex)
 		cm.commitIndex = args.LeaderTotalCommit
 		// 存在部分提交数据未被持久化，导致map中的数据并不是最新的,重新执行一遍未持久化但是已提交的命令
@@ -649,7 +646,6 @@ func (cm *ConsensusModule) startElection() {
 			var reply RequestVoteReply
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				// 成功获得返回的处理逻辑
-
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				cm.dlog("received RequestVoteReply %+v", reply)
@@ -784,16 +780,16 @@ func (cm *ConsensusModule) persistCommitLogTimer(persistTimeout time.Duration) {
 		}
 
 		if doSend { // 需要持久化
-			cm.mu.Lock()
-			// 只有leader和follower才可以持久化
-			if cm.state != Leader && cm.state != Follower {
-				cm.mu.Unlock()
-				return
-			}
-			cm.dlog("[persistLog] execute persist in term := %+v, state=%+v", cm.currentTerm, cm.state)
-			cm.mu.Unlock()
+			//cm.mu.Lock()
+			//// 只有leader和follower才可以持久化
+			//if cm.state != Leader && cm.state != Follower {
+			//	cm.mu.Unlock()
+			//	return
+			//}
+			//cm.dlog("[persistLog] execute persist in term := %+v, state=%+v", cm.currentTerm, cm.state)
+			//cm.mu.Unlock()
 			// 执行持久化逻辑
-			go cm.PersistenceMap()
+			cm.PersistenceMap()
 		}
 	}
 }
@@ -888,8 +884,8 @@ func (cm *ConsensusModule) leaderSendAEs() {
 						savedTotalCommitIndex := cm.commitIndex
 						// 相对索引
 						savedCommitIndex := cm.getCurrentLogIndex(cm.commitIndex)
-						cm.dlog("[Commit Info]: check from %d to %d, savedCommitIndex=%+v,persistIndex=%+v,log=%+v",
-							savedCommitIndex+1, len(cm.log), savedCommitIndex, cm.persistIndex, cm.log)
+						cm.dlog("[Commit Info]: check from %d to %d, savedCommitIndex=%+v,persistIndex=%+v,ni=%v,nextIndex=%v,log=%+v",
+							savedCommitIndex+1, len(cm.log), savedCommitIndex, cm.persistIndex, ni, cm.nextIndex[peerId], cm.log)
 						// 一个个检查是否被大多数接收成功
 						for i := savedCommitIndex + 1; i < len(cm.log); i++ {
 							// 只有任期相同的数据才是有效的
@@ -908,6 +904,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 								if matchCount*2 > len(cm.peerIds)+1 {
 									// 这里修改只可能发生一次，下一次重复逻辑会因为commitIndex发生变化儿无法进行for循环
 									savedNewCommitIndex := cm.commitIndex
+									cm.dlog("cpp commitIndex,outer=%v,inner=%v", savedTotalCommitIndex, savedNewCommitIndex)
 									cm.commitIndex = cm.getTotalLogIndex(i)
 									cm.dealWithCommands(savedNewCommitIndex)
 									cm.dlog("Leader CommitIndex Update,commitIndex from %v to %v,commandMap=%+v", savedNewCommitIndex, cm.commitIndex, cm.commandMap)
@@ -949,7 +946,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 						} else { // 全量复制
 							cm.nextIndex[peerId] = reply.ConflictIndex
 						}
-						cm.dlog("AppendEntries reply from %d failed :nextIndex := %d, reply=[ConflictTerm=%+v,ConflictIndex=%+v]", peerId, cm.nextIndex[peerId], reply.ConflictTerm, reply.ConflictIndex)
+						cm.dlog("AppendEntries reply from %d failed: ni=%v,nextIndex := %d, reply=[ConflictTerm=%+v,ConflictIndex=%+v]", peerId, ni, cm.nextIndex[peerId], reply.ConflictTerm, reply.ConflictIndex)
 					}
 				}
 			}
@@ -1046,13 +1043,7 @@ func (cm *ConsensusModule) PersistenceMap() {
 	// 计算日志中的相对索引
 	cm.dlog("persist Info [before]: lastApplied=%+v,commitIndex=%+v,persistIndex=%+v,log==%+v", cm.lastApplied, cm.commitIndex, cm.persistIndex, cm.log)
 	currentCommitIndex := cm.getCurrentLogIndex(cm.commitIndex)
-	// 计算新的持久化索引
-	cm.persistIndex = cm.commitIndex
-	// 丢弃日志
-	cm.log = cm.log[currentCommitIndex+1:]
-	cm.dlog("persist Info [after]: lastApplied=%+v,commitIndex=%+v,persistIndex=%+v,log==%+v", cm.lastApplied, cm.commitIndex, cm.persistIndex, cm.log)
-	// 先存储运行中的数据
-	cm.persistToStorage()
+
 	if cm.state == Follower && (cm.commandMap == nil || len(cm.commandMap) == 0) {
 		cm.dlog("state=%+v, commandMap without data, persist PASS", cm.state)
 		cm.mu.Unlock()
@@ -1066,8 +1057,17 @@ func (cm *ConsensusModule) PersistenceMap() {
 	// 获得完内存数据后释放锁，其他协程可以继续处理业务
 	cm.dlog("state=%+v,currentTerm=%+v,persistIndex=%v, commandMap=%v,commandData=%+v", cm.state, cm.currentTerm, cm.persistIndex, cm.commandMap, commandData.Bytes())
 	cm.mu.Unlock()
+	// 更新快照
 	cm.storage.SnapShot(commandData.Bytes())
-
+	// 更新数据
+	cm.mu.Lock()
+	// 计算新的持久化索引
+	cm.persistIndex = cm.commitIndex
+	cm.log = cm.log[currentCommitIndex+1:]
+	// 存储运行中的数据
+	cm.persistToStorage()
+	cm.dlog("persist Info [after]: lastApplied=%+v,commitIndex=%+v,persistIndex=%+v,log==%+v", cm.lastApplied, cm.commitIndex, cm.persistIndex, cm.log)
+	cm.mu.Unlock()
 	cm.dlog("PersistenceMap done")
 }
 
@@ -1104,6 +1104,7 @@ func (cm *ConsensusModule) dealWithCommands(saveCommitIndex int) {
 	for i := currentSavedCommitIndex + 1; i <= currentCommitIndex; i++ {
 		logEntre := cm.log[i]
 		command := cm.parseLogToCommand(logEntre)
+		log.Printf("execute command=%v", command)
 		cm.commandMap[command] = command
 	}
 	// 提交max条数据触发持久化

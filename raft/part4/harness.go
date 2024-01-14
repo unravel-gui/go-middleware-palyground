@@ -76,6 +76,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 	// 关闭ready channel会发送一个信息到chan中
 	// 告知监听ready channel的协程已经准备好了
 	close(ready)
+	log.Println("close ready")
 	// 统统装入Harness中
 	h := &Harness{
 		cluster:     ns,
@@ -108,10 +109,11 @@ func (h *Harness) Shutdown() {
 	}
 	for i := 0; i < h.n; i++ {
 		close(h.commitChans[i])
+		log.Printf("close commitChans[%d]\n", i)
 	}
 }
 
-// DisconnectPeer 断开狗哥节点，模拟网络分区
+// DisconnectPeer 断开节点，模拟网络分区
 func (h *Harness) DisconnectPeer(id int) {
 	tlog("Disconnect %d", id)
 	h.cluster[id].DisconnectAll()
@@ -173,6 +175,7 @@ func (h *Harness) RestartPeer(id int) {
 	h.cluster[id].Serve()
 	h.ReconnectPeer(id)
 	close(ready)
+	log.Println("close ready")
 	h.alive[id] = true
 	sleepMs(20)
 }

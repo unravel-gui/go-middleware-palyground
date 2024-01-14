@@ -355,12 +355,16 @@ func TestDisconnectLeaderBriefly(t *testing.T) {
 	// Leader节点重联
 	h.DisconnectPeer(origLeaderId)
 	// 小于超时时间不会重选Leader节点
-	sleepMs(20)
+	sleepMs(2)
 	h.ReconnectPeer(origLeaderId)
 	sleepMs(200)
+	newLeaderId, _ := h.CheckSingleLeader()
+	if newLeaderId != origLeaderId {
+		t.Fatal("orgin LeaderId is change")
+	}
 	// 提交数据给旧Leader节点
 	h.SubmitToServer(origLeaderId, 7)
-	sleepMs(250)
+	sleepMs(450)
 	h.CheckCommittedN(7, 3)
 }
 
@@ -411,7 +415,7 @@ func TestCommitsWithLeaderDisconnects(t *testing.T) {
 
 	// 网络恢复后集群正常工作
 	h.SubmitToServer(newLeaderId, 9)
-	sleepMs(250)
+	sleepMs(450)
 	h.CheckCommittedN(9, 5)
 	h.CheckCommittedN(8, 5)
 
