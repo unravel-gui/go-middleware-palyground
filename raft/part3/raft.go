@@ -74,8 +74,8 @@ type ConsensusModule struct {
 	state              CMState   // 节点状态 Candidate/Follower/Leader/Dead
 	electionResetEvent time.Time // 选举超时开始计算的时间，通过更新它来保证心跳
 
-	nextIndex  map[int]int
-	matchIndex map[int]int
+	nextIndex  map[int]int // 下一个需要同步的日志索引
+	matchIndex map[int]int // 已同步的日志索引
 }
 
 func NewConsensusModule(id int, peerIds []int, server *Server, storage Storage, ready <-chan interface{}, commitChan chan<- CommitEntry) *ConsensusModule {
@@ -459,7 +459,7 @@ func (cm *ConsensusModule) startElection() {
 
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				cm.dlog("received RequestVoteReply %+v", reply)
+				cm.dlog("received proto.RequestVoteReply %+v", reply)
 				// 判断当期节点是否还是Candidate，可能会被其他协程改变，如果不是则不需要走下面的逻辑
 				if cm.state != Candidate {
 					cm.dlog("while waiting for reply, state = %v", cm.state)
@@ -467,7 +467,7 @@ func (cm *ConsensusModule) startElection() {
 				}
 				// 对方任期更大，表示对方数据更新，当前节点不可能当选Leader，转为Follower节点
 				if reply.Term > cm.currentTerm {
-					cm.dlog("term out of date in RequestVoteReply")
+					cm.dlog("term out of date in proto.RequestVoteReply")
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == savedCurrentTerm { // 任期相同
