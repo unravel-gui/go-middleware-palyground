@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/gob"
 	"errors"
 	"fmt"
 )
@@ -45,7 +46,11 @@ func StringToOpType(s string) (OpType, error) {
 
 type Command struct {
 	OpType
-	Params interface{}
+	Params *FileMeta
+}
+
+func (cmd *Command) String() string {
+	return fmt.Sprintf("{OpType=%v,Params=%+v}", cmd.OpType, cmd.Params.String())
 }
 
 type HandlerMap map[string]Handler
@@ -58,9 +63,9 @@ type CommandProcessor struct {
 	handlerMap HandlerMap
 }
 
-//type ConsensusModule struct {
-//	FileMap *FileMetadataStore
-//}
+func init() {
+	gob.Register(Command{})
+}
 
 func NewCommandProcessor(cm *ConsensusModule) *CommandProcessor {
 	cp := new(CommandProcessor)
@@ -98,11 +103,12 @@ func (insertHandler *InsertFileMetaHandler) Execute(command Command) (interface{
 	if command.OpType != INSERT_FILE {
 		return nil, errors.New(fmt.Sprintf("command is not insert,is %v", command.OpType))
 	}
-	if fileMeta, ok := command.Params.(*FileMeta); ok {
+	//if fileMeta, ok := command.Params.(*FileMeta); ok {
+	if fileMeta := command.Params; fileMeta != nil {
 		insertHandler.cm.FileMap.Upsert(fileMeta)
 		return nil, nil
 	} else {
-		return nil, errors.New(fmt.Sprintf("Not a FileMeta type"))
+		return nil, errors.New(fmt.Sprintf("Not a FileMeta type, fm= %+v", command.Params))
 	}
 }
 
@@ -114,11 +120,12 @@ func (modifyHandler *ModifyFileMetaHandler) Execute(command Command) (interface{
 	if command.OpType != MODIFY_FILE {
 		return nil, errors.New(fmt.Sprintf("command is not modify,is %v", command.OpType))
 	}
-	if fileMeta, ok := command.Params.(*FileMeta); ok {
+	//if fileMeta, ok := command.Params.(*FileMeta); ok {
+	if fileMeta := command.Params; fileMeta != nil {
 		modifyHandler.cm.FileMap.Upsert(fileMeta)
 		return nil, nil
 	} else {
-		return nil, errors.New(fmt.Sprintf("Not a FileMeta type"))
+		return nil, errors.New(fmt.Sprintf("Not a FileMeta type, fm= %+v", command.Params))
 	}
 }
 
@@ -130,11 +137,12 @@ func (deleteHandler *DeleteFileMetaHandler) Execute(command Command) (interface{
 	if command.OpType != DELETE_FILE {
 		return nil, errors.New(fmt.Sprintf("command is not delete,is %v", command.OpType))
 	}
-	if fileMeta, ok := command.Params.(*FileMeta); ok {
+	//if fileMeta, ok := command.Params.(*FileMeta); ok {
+	if fileMeta := command.Params; fileMeta != nil {
 		deleteHandler.cm.FileMap.Delete(fileMeta.FileHash)
 		return nil, nil
 	} else {
-		return nil, errors.New(fmt.Sprintf("Not a FileMeta type"))
+		return nil, errors.New(fmt.Sprintf("Not a FileMeta type, fm= %+v", command.Params))
 	}
 }
 
@@ -146,10 +154,11 @@ func (queryHandler *QueryFileMetaHandler) Execute(command Command) (interface{},
 	if command.OpType != QUERY_FILE {
 		return nil, errors.New(fmt.Sprintf("command is not query,is %v", command.OpType))
 	}
-	if fileMeta, ok := command.Params.(*FileMeta); ok {
+	//if fileMeta, ok := command.Params.(*FileMeta); ok {
+	if fileMeta := command.Params; fileMeta != nil {
 		fileMata, _ := queryHandler.cm.FileMap.Get(fileMeta.FileHash)
 		return fileMata, nil
 	} else {
-		return nil, errors.New(fmt.Sprintf("Not a FileMeta type"))
+		return nil, errors.New(fmt.Sprintf("Not a FileMeta type, fm= %+v", command.Params))
 	}
 }

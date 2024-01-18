@@ -108,6 +108,7 @@ func (l *BasicLogger) levelToString(level LogLevel) string {
 		return "UNKNOWN"
 	}
 }
+
 func (l *BasicLogger) SetLevel(flag LogLevel) {
 	l.mu.Lock()
 	defer l.mu.Unlock()

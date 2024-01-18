@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/gob"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -12,10 +13,10 @@ import (
 type Storage interface {
 	Set(key string, value []byte)
 	Get(key string) ([]byte, bool)
-	PersistToFile()
-	recoverFromFile() bool
-	SnapShot(data map[string][]byte) bool
-	getSnapShot() map[string][]byte
+	PersistToFile() error
+	recoverFromFile() error
+	SnapShot(data map[string][]byte) error
+	getSnapShot() (map[string][]byte, error)
 	HasData() bool
 }
 
@@ -49,104 +50,95 @@ func NewMapStorage(runtimeFilename, snapShotFilename string, persistReadyChan ch
 }
 
 // PersistToFile 持久化运行数据
-func (ms *MapStorage) PersistToFile() {
+func (ms *MapStorage) PersistToFile() error {
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(ms.runtimeDataFilename), 0755); err != nil {
-		dlog.Error("creating dir of runtime data err: %v", err)
-		return
+		return fmt.Errorf("creating dir of runtime data err: %v", err)
+
 	}
 	file, err := os.Create(ms.runtimeDataFilename)
 	if err != nil {
-		dlog.Error("create runtime data file err:%v", err)
-		return
+		return fmt.Errorf("create runtime data file err:%v", err)
+
 	}
 	defer file.Close()
 	snapShot := SnapShot{
 		M: ms.m,
 	}
 	if err = gob.NewEncoder(file).Encode(snapShot); err != nil {
-		dlog.Error("persisting runtime data Error: %v", err)
+		return fmt.Errorf("persisting runtime data Error: %v", err)
 	}
+	return nil
 }
 
-func (ms *MapStorage) recoverFromFile() bool {
+func (ms *MapStorage) recoverFromFile() error {
 	// 读取运行数据
 	if fileExists(ms.runtimeDataFilename) {
-		dlog.Debug("the name of the runtime data file is: [%s]", ms.runtimeDataFilename)
 		// 文件存在
 		file, err := os.Open(ms.runtimeDataFilename)
 		if err != nil {
-			dlog.Error("open runtime data file err:%v", err)
-			return false
+			return fmt.Errorf("open runtime data file err:%v", err)
+
 		}
 		defer file.Close()
 		decoder := gob.NewDecoder(file)
 		var snapShot SnapShot
 		err = decoder.Decode(&snapShot)
 		if err != nil && err != io.EOF {
-			dlog.Error("recovering runtime data from the file Error: %v", err)
-			return false
+			return fmt.Errorf("recovering runtime data from the file Error: %v", err)
 		}
 		// 将持久化的数据给到ms
 		if snapShot.M != nil {
 			ms.m = snapShot.M
 		}
-		return true
+		return nil
 	} else {
-		dlog.Warn("the runtime data file does not exist, path=[%s]", ms.runtimeDataFilename)
-		return false
+		return fmt.Errorf("the runtime data file does not exist, path=[%s]", ms.runtimeDataFilename)
 	}
 }
 
-func (ms *MapStorage) SnapShot(data map[string][]byte) bool {
+func (ms *MapStorage) SnapShot(data map[string][]byte) error {
 	ms.mu.Lock()
 	snapShotFilename := ms.snapShotFilename
 	ms.mu.Unlock()
 	if err := os.MkdirAll(filepath.Dir(snapShotFilename), 0755); err != nil {
-		dlog.Error("creating dir of snapshot error: %v", err)
-		return false
+		return fmt.Errorf("creating dir of snapshot error: %v", err)
 	}
 	file, err := os.Create(snapShotFilename)
 	if err != nil {
-		dlog.Error("create snapshot file err:%v", err)
-		return false
+		return fmt.Errorf("create snapshot file err:%v", err)
 	}
 	defer file.Close()
 	snapShot := SnapShot{
 		M: data,
 	}
 	if err = gob.NewEncoder(file).Encode(snapShot); err != nil {
-		dlog.Error("persisting snapshot Error: %v", err)
-		return false
+		return fmt.Errorf("persisting snapshot Error: %v", err)
 	}
-	dlog.Info("persist snapShot success!")
-	return true
+	return nil
 }
 
-func (ms *MapStorage) getSnapShot() map[string][]byte {
+func (ms *MapStorage) getSnapShot() (map[string][]byte, error) {
 	ms.mu.Lock()
 	snapShotFilename := ms.snapShotFilename
 	ms.mu.Unlock()
 	if fileExists(snapShotFilename) {
 		file, err := os.Open(snapShotFilename)
 		if err != nil {
-			dlog.Error("open snapshot err:%v", err)
-			return nil
+			return nil, fmt.Errorf("open snapshot err:%v", err)
 		}
 		defer file.Close()
 		decoder := gob.NewDecoder(file)
 		var snapShot SnapShot
 		err = decoder.Decode(&snapShot)
 		if err != nil && err != io.EOF {
-			dlog.Error("recovering data from snapshot Error: %v", err)
-			return nil
+			return nil, fmt.Errorf("recovering data from snapshot Error: %v", err)
 		}
-		dlog.Info("load snapShot success!")
-		return snapShot.M
+		return snapShot.M, nil
 	} else {
-		dlog.Warn("snapShot does not exist, path=[%s]", ms.runtimeDataFilename)
-		return nil
+		return nil, fmt.Errorf("snapShot does not exist, path=[%s]", ms.runtimeDataFilename)
+
 	}
 }
 

@@ -3,6 +3,8 @@ package raft
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
+	"fmt"
 	"math/rand"
 	"os"
 	"raft/part5/common"
@@ -20,6 +22,8 @@ const (
 	Dead
 )
 
+var sendTime time.Time
+
 func (s CMState) String() string {
 	switch s {
 	case Follower:
@@ -35,11 +39,13 @@ func (s CMState) String() string {
 	}
 }
 
-var dlog = logger.DLogger
-
 type LogEntry struct {
-	Command interface{}
+	Command Command
 	Term    int
+}
+
+func (le LogEntry) String() string {
+	return fmt.Sprintf("{Term: %d, Command: %+v}", le.Term, le.Command)
 }
 
 type ConsensusModule struct {
@@ -60,6 +66,7 @@ type ConsensusModule struct {
 	lastLogTerm        int        // 记录最新一条日志的Term
 	electionResetEvent time.Time  // 上一个时间的时间
 
+	cp      *CommandProcessor
 	FileMap *FileMetadataStore // 存储内存中的元数据
 	//ListMap map[string]interface{} // 存储节点数据
 
@@ -71,9 +78,12 @@ type ConsensusModule struct {
 	storage          Storage               // 存储对象实现 Storage接口，提供持久化服务
 	persistReadyChan chan struct{}         // 用于通知持久化
 	ac               *common.AtomicCounter // 计数器，用于触发持久化
+
+	logger logger.Logger
 }
 
-func NewConsensusModule(endpoint string, peerEndpoints []string, server *Server, storage Storage, ready <-chan interface{}) *ConsensusModule {
+func NewConsensusModule(endpoint string, peerEndpoints []string, server *Server, storage Storage,
+	ready <-chan interface{}, log logger.Logger) *ConsensusModule {
 	cm := new(ConsensusModule)
 	cm.endpoint = endpoint
 	cm.peerEndpoints = peerEndpoints
@@ -83,7 +93,8 @@ func NewConsensusModule(endpoint string, peerEndpoints []string, server *Server,
 	cm.commitIndex = -1
 	cm.persistIndex = -1
 	cm.lastLogTerm = -1
-
+	cm.logger = log
+	cm.cp = NewCommandProcessor(cm)
 	cm.FileMap = NewFileMetadataStore()
 	//cm.ListMap = make(map[string]interface{})
 
@@ -96,13 +107,13 @@ func NewConsensusModule(endpoint string, peerEndpoints []string, server *Server,
 	cm.ac = common.NewAtomicCounter(int64(cm.server.config.AcMax))
 
 	if cm.storage.HasData() {
-		dlog.Info("NewConsensusModule has data")
+		cm.logger.Info("NewConsensusModule has data")
 		// 从文件中恢复运行时数据
-		cm.recoverRuntimeData()
-		dlog.Info("recover from file: currentTerm=%v,persistIndex=%v,raftLog=%v,FileMap=%v,lastLogTerm=%v",
+		cm.recoverFromStorage()
+		cm.logger.Info("recover from file: currentTerm=%v,persistIndex=%v,raftLog=%+v,FileMap=%+v,lastLogTerm=%v",
 			cm.currentTerm, cm.persistIndex, cm.raftLog, cm.FileMap, cm.lastLogTerm)
 	} else {
-		dlog.Warn("NewConsensusModule start without data")
+		cm.logger.Info("NewConsensusModule start without data")
 	}
 
 	go func() {
@@ -111,7 +122,9 @@ func NewConsensusModule(endpoint string, peerEndpoints []string, server *Server,
 		cm.mu.Lock()
 		cm.electionResetEvent = time.Now()
 		cm.mu.Unlock()
-		// TODO: 启动定时器任务：心跳和持久化
+		// 启动定时器任务：心跳和持久化
+		go cm.runElectionTimer()
+		go cm.persistLogTimer()
 	}()
 
 	return cm
@@ -123,9 +136,9 @@ func (cm *ConsensusModule) Report() (endpoint string, term int, isLeader bool) {
 	return cm.endpoint, cm.currentTerm, cm.state == Leader
 }
 
-func (cm *ConsensusModule) Submit(command interface{}) bool {
+func (cm *ConsensusModule) Submit(command Command) bool {
 	cm.mu.Lock()
-	dlog.Info("Submit received by %v: %v", cm.state, command)
+	cm.logger.Info("Submit received by %v: command=%v", cm.state, command.String())
 	if cm.state == Leader {
 		cm.raftLog = append(cm.raftLog, LogEntry{
 			Command: command,
@@ -134,7 +147,7 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 		cm.lastLogTerm = cm.currentTerm
 		// 持久化运行时数据
 		cm.persisRuntime()
-		dlog.Info("... raftLog=%v", cm.raftLog)
+		cm.logger.Info("... raftLog=%+v", cm.raftLog)
 		cm.mu.Unlock()
 		// 通知日志同步
 		cm.triggerAEChan <- struct{}{}
@@ -144,92 +157,138 @@ func (cm *ConsensusModule) Submit(command interface{}) bool {
 	return false
 }
 
+func (cm *ConsensusModule) Read(command interface{}) (interface{}, error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	cm.logger.Info("read req by %v: %v", cm.state, command)
+	if cm.server.config.Read && cm.state != Leader {
+		return nil, fmt.Errorf("only operations from the Leader are allowed,endpoint=%v,state=%v",
+			cm.endpoint, cm.state)
+	}
+	cmd, ok := command.(Command)
+	if !ok {
+		errMsg := fmt.Sprintf("it is not Command type, command=%v", command)
+		cm.logger.Error(errMsg)
+		return nil, errors.New(errMsg)
+	}
+	result, err := cm.cp.Process(cmd)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+
+}
+
 func (cm *ConsensusModule) Stop() {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
 	cm.state = Dead
-	dlog.Info("becomes Dead")
+	cm.logger.Info("becomes Dead")
 	close(cm.triggerAEChan)
 	close(cm.persistReadyChan)
 }
 
 // ##################################   持久化模块  #######################################################################
 
-// 从文件中恢复数据，包括运行时数据和数据实体
-func (cm *ConsensusModule) recoverRuntimeData() {
+func (cm *ConsensusModule) recoverFromStorage() {
 	// 先恢复快照数据
-	if snapShot := cm.storage.getSnapShot(); snapShot != nil {
+	if cm.recoverSnapShot() {
+		// 只有存在 数据的运行时数据才是有效的
+		// 加载运行时数据
+		cm.recoverRuntime()
+	}
+}
+
+func (cm *ConsensusModule) recoverSnapShot(data ...map[string][]byte) bool {
+	var snapShot map[string][]byte
+	var err error
+	if len(data) > 0 {
+		snapShot = data[0]
+	} else {
+		snapShot, err = cm.storage.getSnapShot()
+		if err != nil {
+			cm.logger.Error("recover from snapShot err=%v", err)
+			return false
+		}
+	}
+	if snapShot != nil {
 		if fileMapData, found := snapShot["FileMap"]; found {
 			d := gob.NewDecoder(bytes.NewReader(fileMapData))
 			if err := d.Decode(&cm.FileMap); err != nil {
-				dlog.Error("recover FileMap err: %v", err)
+				cm.logger.Error("recover FileMap err: %v", err)
+				return false
 			}
+			return true
 		} else {
-			dlog.Error("FileMap not found in storage")
+			cm.logger.Error("FileMap not found in storage")
+			return false
 		}
 	} else {
-		dlog.Warn("snapShot not found")
+		cm.logger.Warn("load snapShot error, err= %v", err)
 		// 数据文件为空那么只加载运行时数据将丢失
-		return
+		return false
 	}
+}
 
-	// 加载运行时数据
-	if exist := cm.storage.recoverFromFile(); exist {
+// 从文件中恢复运行时数据
+func (cm *ConsensusModule) recoverRuntime() {
+	if err := cm.storage.recoverFromFile(); err == nil {
 		if termData, found := cm.storage.Get("currentTerm"); found {
 			d := gob.NewDecoder(bytes.NewReader(termData))
 			if err := d.Decode(&cm.currentTerm); err != nil {
-				dlog.Error("recover runtime data, decode `currentTerm` err=%+v", err)
+				cm.logger.Error("recover runtime data, decode `currentTerm` err=%+v", err)
 			}
 		} else {
-			dlog.Error("currentTerm not found in storage")
+			cm.logger.Error("currentTerm not found in storage")
 		}
 		if voteData, found := cm.storage.Get("votedFor"); found {
 			d := gob.NewDecoder(bytes.NewBuffer(voteData))
 			if err := d.Decode(&cm.votedFor); err != nil {
-				dlog.Error("recover runtime data, decode `votedFor` err=%+v", err)
+				cm.logger.Error("recover runtime data, decode `votedFor` err=%+v", err)
 			}
 		} else {
-			dlog.Error("votedFor not found in storage")
+			cm.logger.Error("votedFor not found in storage")
 		}
 		if raftLogData, found := cm.storage.Get("raftLog"); found {
 			d := gob.NewDecoder(bytes.NewBuffer(raftLogData))
 			if err := d.Decode(&cm.raftLog); err != nil {
-				dlog.Error("recover runtime data, decode `raftLog` err=%+v", err)
+				cm.logger.Error("recover runtime data, decode `raftLog` err=%+v", err)
 			}
 		} else {
-			dlog.Error("raftLog not found in storage")
+			cm.logger.Error("raftLog not found in storage")
 		}
 
 		if acData, found := cm.storage.Get("ac"); found {
 			d := gob.NewDecoder(bytes.NewBuffer(acData))
 			var value int64
 			if err := d.Decode(&value); err != nil {
-				dlog.Error("recover runtime data, decode `ac` err=%+v", err)
+				cm.logger.Error("recover runtime data, decode `ac` err=%+v", err)
 			}
 			cm.ac.SetValue(value)
 		} else {
-			dlog.Error("ac not found in storage")
+			cm.logger.Error("ac not found in storage")
 		}
 		if persistIndexData, found := cm.storage.Get("persistIndex"); found {
 			d := gob.NewDecoder(bytes.NewBuffer(persistIndexData))
 			if err := d.Decode(&cm.persistIndex); err != nil {
-				dlog.Error("recover runtime data, decode `persistIndex` err=%+v", err)
+				cm.logger.Error("recover runtime data, decode `persistIndex` err=%+v", err)
 			}
 			cm.commitIndex = cm.persistIndex
 		} else {
-			dlog.Error("persistIndex not found in storage")
+			cm.logger.Error("persistIndex not found in storage")
 		}
 		if lastLogTermData, found := cm.storage.Get("lastLogTerm"); found {
 			d := gob.NewDecoder(bytes.NewBuffer(lastLogTermData))
 			if err := d.Decode(&cm.lastLogTerm); err != nil {
-				dlog.Error("recover runtime data, decode `lastLogTerm` err=%+v", err)
+				cm.logger.Error("recover runtime data, decode `lastLogTerm` err=%+v", err)
 			}
 		} else {
-			dlog.Error("lastLogTerm not found in storage")
+			cm.logger.Error("lastLogTerm not found in storage")
 		}
-		dlog.Info("runtime data load success")
+		cm.logger.Info("runtime data load success")
 	} else {
-		dlog.Warn("runtime data load failed")
+		cm.logger.Warn("runtime data load error,err= %v", err)
 	}
 }
 
@@ -237,37 +296,37 @@ func (cm *ConsensusModule) recoverRuntimeData() {
 func (cm *ConsensusModule) persisRuntime() {
 	var termData bytes.Buffer
 	if err := gob.NewEncoder(&termData).Encode(cm.currentTerm); err != nil {
-		dlog.Error("persist runtime data, encode `currentTerm` err=%+v", err)
+		cm.logger.Error("persist runtime data, encode `currentTerm` err=%+v", err)
 	}
 	cm.storage.Set("currentTerm", termData.Bytes())
 
 	var voteData bytes.Buffer
 	if err := gob.NewEncoder(&voteData).Encode(cm.votedFor); err != nil {
-		dlog.Error("persist runtime data, encode `votedFor` err=%+v", err)
+		cm.logger.Error("persist runtime data, encode `votedFor` err=%+v", err)
 	}
 	cm.storage.Set("votedFor", voteData.Bytes())
 
 	var raftLogData bytes.Buffer
 	if err := gob.NewEncoder(&raftLogData).Encode(cm.raftLog); err != nil {
-		dlog.Error("persist runtime data, encode `raftLog` err=%+v", err)
+		cm.logger.Error("persist runtime data, encode `raftLog` err=%+v", err)
 	}
 	cm.storage.Set("raftLog", raftLogData.Bytes())
 
 	var acData bytes.Buffer
 	if err := gob.NewEncoder(&acData).Encode(cm.ac.Value()); err != nil {
-		dlog.Error("persist runtime data, encode `ac` err=%+v", err)
+		cm.logger.Error("persist runtime data, encode `ac` err=%+v", err)
 	}
 	cm.storage.Set("ac", acData.Bytes())
 
 	var persistIndexData bytes.Buffer
 	if err := gob.NewEncoder(&persistIndexData).Encode(cm.persistIndex); err != nil {
-		dlog.Error("persist runtime data, encode `persistIndex` err=%+v", err)
+		cm.logger.Error("persist runtime data, encode `persistIndex` err=%+v", err)
 	}
 	cm.storage.Set("persistIndex", persistIndexData.Bytes())
 
 	var lastLogTermData bytes.Buffer
 	if err := gob.NewEncoder(&lastLogTermData).Encode(cm.lastLogTerm); err != nil {
-		dlog.Error("persist runtime data, encode `lastLogTerm` err=%+v", err)
+		cm.logger.Error("persist runtime data, encode `lastLogTerm` err=%+v", err)
 	}
 	cm.storage.Set("lastLogTerm", lastLogTermData.Bytes())
 
@@ -281,47 +340,47 @@ func (cm *ConsensusModule) persisRuntime() {
 func (cm *ConsensusModule) persistSnapShot() {
 	cm.mu.Lock()
 	if cm.state != Leader && cm.state != Follower {
-		dlog.Warn("Only Leader and Follower are allowed to persist snapshot, state=%v", cm.state)
+		//cm.logger.Warn("Only Leader and Follower are allowed to persist snapshot, state=%v", cm.state)
 		cm.mu.Unlock()
 		return
 	}
 	// 将当前已提交部分持久化
 	// 如果持久化进度和提交进度一致则无需重复持久化
 	if cm.persistIndex == cm.commitIndex {
-		dlog.Info("committed data has been currently persisted, currentTerm=%v,persisIndex=%v",
-			cm.currentTerm, cm.persistIndex)
+		//cm.logger.Debug("committed data has been currently persisted, currentTerm=%v,persisIndex=%v",
+		//	cm.currentTerm, cm.persistIndex)
 		cm.mu.Unlock()
 		return
 	}
-	dlog.Debug("[before persistence]: currentTerm=%v,persistIndex=%v,commitIndex=%v,raftLog=%v",
+	cm.logger.Debug("[before persistence]: currentTerm=%v,persistIndex=%v,commitIndex=%v,raftLog=%+v",
 		cm.currentTerm, cm.persistIndex, cm.commitIndex, cm.raftLog)
 	relCommitIndex := cm.getRelLogIndex(cm.commitIndex)
 	cm.persistIndex = cm.commitIndex
 	// 丢弃日志
 	cm.raftLog = cm.raftLog[relCommitIndex+1:]
-	dlog.Debug("[after persistence]: currentTerm=%v,persistIndex=%v,commitIndex=%v,raftLog=%v",
+	cm.logger.Debug("[after persistence]: currentTerm=%v,persistIndex=%v,commitIndex=%v,raftLog=%+v",
 		cm.currentTerm, cm.persistIndex, cm.commitIndex, cm.raftLog)
 	// 持久化运行时数据
 	cm.persisRuntime()
 	if cm.state == Follower && (cm.FileMap == nil || cm.FileMap.Length() == 0) {
-		dlog.Warn("state=%+v, FileMap without data, Skip persistence", cm.state)
+		cm.logger.Warn("state=%+v, FileMap without data, Skip persistence", cm.state)
 		cm.mu.Unlock()
 		return
 	}
 	commandMap := make(map[string][]byte)
 	var fileMapData bytes.Buffer
 	if err := gob.NewEncoder(&fileMapData).Encode(cm.FileMap); err != nil {
-		dlog.Error("persist FileMap Error, err=%v", err)
+		cm.logger.Error("persist FileMap Error, err=%v", err)
 	} else {
 		commandMap["FileMap"] = fileMapData.Bytes()
-		dlog.Debug("state=%v,currentTerm=%+v，FileMap=%v", cm.state, cm.currentTerm, cm.FileMap)
+		cm.logger.Debug("state=%v,currentTerm=%+v，FileMap=%+v", cm.state, cm.currentTerm, cm.FileMap)
 	}
 	cm.mu.Unlock()
-	result := cm.storage.SnapShot(commandMap)
-	if result {
-		dlog.Info("persist success")
+	err := cm.storage.SnapShot(commandMap)
+	if err == nil {
+		cm.logger.Info("persist success")
 	} else {
-		dlog.Info("persist failed")
+		cm.logger.Error("persist error,err= %v", err)
 	}
 }
 
@@ -350,29 +409,35 @@ func (cm *ConsensusModule) RequestVote(args RequestVotedArgs, reply *RequestVote
 	if cm.state == Dead {
 		return nil
 	}
-	lastAbsLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
-	dlog.Debug("RequestVote: args=%+v [currentTerm=%d, votedFor=%d, lastAbsLogIndex=%d, lastLogTerm=%d ]", args, cm.currentTerm, cm.votedFor, lastAbsLogIndex, lastLogTerm)
-
 	if args.Term > cm.currentTerm {
-		dlog.Info("... term out of date in RequestVote")
+		cm.logger.Info("... term out of date in RequestVote")
 		cm.becomeFollower(args.Term)
 	}
+	lastAbsLogIndex, lastLogTerm := cm.lastLogIndexAndTerm()
+	cm.logger.Debug("RequestVote: args=%+v [currentTerm=%d, votedFor=%s, lastAbsLogIndex=%d, lastLogTerm=%d ]",
+		args, cm.currentTerm, cm.votedFor, lastAbsLogIndex, lastLogTerm)
 
 	reply.VotedGranted = false
 	if cm.currentTerm == args.Term && // 任期相同
-		cm.votedFor == "" || cm.votedFor == args.CandidateEndpoint { // 未将票给其他节点
-		if args.LastLogTerm > lastLogTerm || // 最新一条日志的任期更高，数据更新
-			args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastAbsLogIndex { // 最新一条日志的任期相同，索引更大则数据更新
-			reply.VotedGranted = true
-			cm.votedFor = args.CandidateEndpoint
-			cm.electionResetEvent = time.Now()
-		}
+		(cm.votedFor == "" || cm.votedFor == args.CandidateEndpoint) && // 未将票给其他节点
+		(args.LastLogTerm > lastLogTerm || // 最新一条日志的任期更高，数据更新
+			(args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastAbsLogIndex)) { // 最新一条日志的任期相同，索引更大则数据更新
+		// 同意投票
+		reply.VotedGranted = true
+		//cm.logger.Debug("((args.LastLogTerm(%v) > lastLogTerm(%v) = %v)||"+
+		//	"(args.LastLogTerm == lastLogTerm-(%v) && args.LastLogIndex(%v) >= lastAbsLogIndex(%v))(%v)) =(%v)",
+		//	args.LastLogTerm, lastLogTerm, args.LastLogTerm > lastLogTerm, args.LastLogTerm == lastLogTerm, args.LastLogIndex, lastAbsLogIndex,
+		//	args.LastLogIndex >= lastAbsLogIndex, args.LastLogTerm > lastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastAbsLogIndex))
+		cm.logger.Debug("vote for CandidateEndpoint=%v", args.CandidateEndpoint)
+		cm.votedFor = args.CandidateEndpoint
+		cm.updateEvent()
 	}
 
 	reply.Term = cm.currentTerm
 	// 数据更新需要持久化
 	cm.persisRuntime()
-	dlog.Debug("... RequestVote reply: %+v", reply)
+	cm.logger.Debug("... RequestVote reply to [%v] from [%v]: %+v",
+		args.CandidateEndpoint, cm.endpoint, *reply)
 	return nil
 }
 
@@ -381,9 +446,9 @@ func (cm *ConsensusModule) startElection() {
 	cm.state = Candidate
 	cm.currentTerm += 1
 	savedCurrentTerm := cm.currentTerm
-	cm.electionResetEvent = time.Now()
+	cm.updateEvent()
 	cm.votedFor = cm.endpoint
-	dlog.Info("becomes Candidate(currentTerm=%d); raftLog=%v", savedCurrentTerm, cm.raftLog)
+	cm.logger.Info("becomes Candidate(currentTerm=%d); raftLog=%+v", savedCurrentTerm, cm.raftLog)
 
 	voteReceived := 1
 	for _, peerEndpoint := range cm.peerEndpoints {
@@ -399,31 +464,33 @@ func (cm *ConsensusModule) startElection() {
 				LastLogTerm:       lastLogTerm,
 			}
 
-			dlog.Debug("sending RequestVote to [%s]: %+v", peerEndpoint, args)
+			cm.logger.Debug("sending RequestVote to [%s]: %+v", peerEndpoint, args)
 			var reply *RequestVotedReply
 			if err := cm.server.Call(peerEndpoint, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
-				dlog.Debug("received RequestVoteReply %v", reply)
+				cm.logger.Debug("received RequestVoteReply from [%v] reply=%+v", peerEndpoint, *reply)
 
 				if cm.state != Candidate {
-					dlog.Info("while waiting for reply, state = %v", cm.state)
+					cm.logger.Debug("while waiting for reply, state = %v", cm.state)
 					return
 				}
 				if reply.Term > cm.currentTerm {
-					dlog.Info("term out of date in RequestVoteReply,term=%d", reply.Term)
+					cm.logger.Debug("term out of date in RequestVoteReply,currentTerm=%v,term=%d", cm.currentTerm, reply.Term)
 					cm.becomeFollower(reply.Term)
 					return
 				} else if reply.Term == savedCurrentTerm {
 					if reply.VotedGranted {
 						voteReceived += 1
 						if voteReceived*2 > len(cm.peerEndpoints)+1 {
-							dlog.Info("wins election with %d vote", voteReceived)
+							cm.logger.Info("wins election with %d vote", voteReceived)
 							cm.startLeader()
 							return
 						}
 					}
 				}
+			} else {
+				cm.logger.Warn("sending RequestVote error,err=%v", err)
 			}
 		}(peerEndpoint)
 	}
@@ -434,35 +501,40 @@ func (cm *ConsensusModule) startElection() {
 
 // 进入Follower状态
 func (cm *ConsensusModule) becomeFollower(term int) {
-	dlog.Info("becomes Follower with term=%d; raftLog=%v", term, cm.raftLog)
+	cm.logger.Info("becomes Follower with term=%d; raftLog=%+v", term, cm.raftLog)
 	cm.state = Follower
 	cm.currentTerm = term
 	cm.votedFor = ""
-	cm.electionResetEvent = time.Now()
+	cm.updateEvent()
 	go cm.runElectionTimer()
 }
 
 func (cm *ConsensusModule) startLeader() {
 	cm.state = Leader
+	sendTime = time.Now()
 	for _, peerEndpoint := range cm.peerEndpoints {
 		cm.nextIndex[peerEndpoint] = cm.getAbsLogIndex(len(cm.raftLog))
 		cm.matchIndex[peerEndpoint] = -1
 	}
-	dlog.Info("becomes Leader; term=%d, absLogLength=%d, commitIndex=%d, persisIndex=%d, FileMap=%v",
-		cm.currentTerm, cm.getAbsLogIndex(len(cm.raftLog)), cm.commitIndex, cm.persistIndex, cm.FileMap)
+	cm.logger.Info("becomes Leader; term=%d, absLogLength=%d, commitIndex=%d, persisIndex=%d, FileMap=%+v",
+		cm.currentTerm, cm.getAbsLogIndex(len(cm.raftLog)), cm.commitIndex, cm.persistIndex, cm.FileMap.Datas())
 
-	heartbeatTimeout := common.RAFT_HEARTNBEAT_TIMEOUT * time.Millisecond
+	heartbeatTimeout := common.RAFT_HEARTNBEAT_SEND * time.Millisecond
+	//heartbeatTimeout := 50 * time.Millisecond
 	go func(heartbeatTimeout time.Duration) {
 		// 发送一次心跳包更新事件
-		cm.leaderSendAEs()
+		cm.logger.Info("Election success, sending heartbeat refresh event")
+		i := 0
+		cm.leaderSendAEs(i)
 		t := time.NewTimer(heartbeatTimeout)
 		defer t.Stop()
-
 		for {
 			doSend := false
+			i++
 			select {
 			case <-t.C:
 				doSend = true
+				//cm.logger.Debug("send heartbeat by timer")
 				t.Stop()
 				t.Reset(heartbeatTimeout)
 			case _, ok := <-cm.triggerAEChan:
@@ -474,8 +546,14 @@ func (cm *ConsensusModule) startLeader() {
 				if !t.Stop() {
 					<-t.C
 				}
+				//cm.logger.Debug("send heartbeat by data,now")
 				t.Reset(heartbeatTimeout)
 			}
+			elapsed := time.Since(sendTime)
+			if elapsed > 0 {
+				sendTime = time.Now()
+			}
+			cm.logger.Debug("send aes %d elapsed=%v,doSend=%v", i, elapsed, doSend)
 			if doSend {
 				cm.mu.Lock()
 				if cm.state != Leader {
@@ -485,7 +563,7 @@ func (cm *ConsensusModule) startLeader() {
 				}
 				cm.mu.Unlock()
 				// 发送心跳包
-				cm.leaderSendAEs()
+				cm.leaderSendAEs(i)
 			}
 		}
 	}(heartbeatTimeout)
@@ -524,19 +602,21 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		return nil
 	}
 	if args.Term > cm.currentTerm {
-		dlog.Info("... term out of date in AppendEntries")
+		cm.logger.Info("... term out of date in AppendEntries")
 		cm.becomeFollower(args.Term)
 	}
 	reply.Success = false
+	cm.logger.Debug("get aes,term=%v", cm.currentTerm)
 	var err error
 	if args.Ac != -1 {
 		err = cm.fullSync(args, reply)
+	} else {
+		err = cm.incrementalSync(args, reply)
 	}
-	err = cm.incrementalSync(args, reply)
 	reply.Term = cm.currentTerm
 	// 持久化运行时数据
 	cm.persisRuntime()
-	dlog.Info("AppendEntries reply to [%v]", args.LeaderEndpoint)
+	cm.logger.Info("AppendEntries reply to [%v],reply=[%+v]", args.LeaderEndpoint, *reply)
 	return err
 }
 
@@ -546,29 +626,29 @@ func (cm *ConsensusModule) fullSync(args AppendEntriesArgs, reply *AppendEntries
 		if cm.state != Follower {
 			cm.becomeFollower(args.Term)
 		}
-		dlog.Info("full sync from [%v]", args.LeaderEndpoint)
-		dlog.Debug("args for full sync from [%v]: [args=%+v, commitIndex=%v,raftLog=%+v, persistIndex=%v]",
+		cm.logger.Info("full sync from [%v]", args.LeaderEndpoint)
+		cm.logger.Debug("args for full sync from [%v]: [args=%+v, commitIndex=%v,raftLog=%+v, persistIndex=%v]",
 			args.LeaderEndpoint, args, cm.commitIndex, cm.raftLog, cm.persistIndex)
-		cm.electionResetEvent = time.Now()
-
-		// TODO: 读取快照数据
-
+		cm.updateEvent()
+		// 读取快照数据
+		cm.recoverSnapShot(args.SnapShot)
 		cm.persistIndex = args.LeaderPersist
 		cm.lastLogTerm = args.LastLogTerm
 		cm.ac.SetValue(args.Ac)
 		cm.commitIndex = args.LeaderCommit
 		if len(args.Entries) > 0 {
 			cm.raftLog = args.Entries
-			dlog.Debug("... full inserting entries raftLog=%+v", cm.raftLog)
+			cm.logger.Debug("... full inserting entries raftLog=%+v", cm.raftLog)
 		}
 		// 持久化的数据实体不是最新的，按顺序重放为被持久化的指令
 		if cm.persistIndex < cm.commitIndex {
-			// TODO: 执行指令
+			// 执行指令
+			cm.dealWithCommands(cm.persistIndex)
 		}
-		dlog.Debug("... setting commitIndex=%d", cm.commitIndex)
+		cm.logger.Debug("... setting commitIndex=%d", cm.commitIndex)
 		reply.Success = true
-		dlog.Debug("after full sync FileMap=%+v", cm.FileMap)
-		dlog.Info("full Sync Success")
+		cm.logger.Debug("after full sync FileMap=%+v", cm.FileMap.Datas())
+		cm.logger.Info("full Sync Success")
 	}
 	return nil
 }
@@ -579,10 +659,10 @@ func (cm *ConsensusModule) incrementalSync(args AppendEntriesArgs, reply *Append
 		if cm.state != Follower {
 			cm.becomeFollower(args.Term)
 		}
-		cm.electionResetEvent = time.Now()
+		cm.updateEvent()
 		totalLogLength := cm.getAbsLogIndex(len(cm.raftLog))
 		relPreLogIndex := cm.getRelLogIndex(args.PreLogIndex)
-		dlog.Debug("Args for incremental sync from [%v]: [args=%+v, totalLogLength=%v,relPreLogIndex=%v,raftLog=%+v, persistIndex=%v,lastLogTerm=%v]",
+		cm.logger.Debug("Args for incremental sync from [%v]: [args=%+v, totalLogLength=%v,relPreLogIndex=%v,raftLog=%+v, persistIndex=%v,lastLogTerm=%v]",
 			args.LeaderEndpoint, args, totalLogLength, relPreLogIndex, cm.raftLog, cm.persistIndex, cm.lastLogTerm)
 		if (args.PreLogIndex == -1 && args.LeaderCommit == -1) || // 集群的节点第一次同步
 			relPreLogIndex == -1 || // 相对索引为-1，Follower在持久化后第一次同步
@@ -605,22 +685,25 @@ func (cm *ConsensusModule) incrementalSync(args AppendEntriesArgs, reply *Append
 				logInsertIndex++
 				newEntriesIndex++
 			}
-			if newEntriesIndex <= len(args.Entries) {
-				dlog.Debug("... inserting entries %v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
+			cm.logger.Debug("logInsertIndex=%v,newEntriesIndex=%v, len(args.Entries)=%+v",
+				logInsertIndex, newEntriesIndex, len(args.Entries))
+			if newEntriesIndex < len(args.Entries) {
+				cm.logger.Debug("... inserting entries %+v from index %d", args.Entries[newEntriesIndex:], logInsertIndex)
 				cm.raftLog = append(cm.raftLog[:logInsertIndex], args.Entries[newEntriesIndex:]...)
-				cm.lastLogTerm = cm.raftLog[len(cm.raftLog)-1].Term
-				dlog.Debug("... log is now: %v", cm.raftLog)
+				cm.logger.Debug("... log is now: %+v", cm.raftLog)
 			}
-			dlog.Debug("incremental sync commit from [%v]: LeaderCommit=%+v, FollowerCommit=%+v,FileMap=%v",
-				args.LeaderEndpoint, args.LeaderEndpoint, cm.commitIndex, cm.FileMap)
+			cm.logger.Debug("incremental sync commit from [%v]: LeaderCommit=%+v, FollowerCommit=%+v,raftLog=%v,FileMap=%+v",
+				args.LeaderEndpoint, args.LeaderCommit, cm.commitIndex, cm.raftLog, cm.FileMap.Datas())
 			if args.LeaderCommit > cm.commitIndex {
-				newTotalLogLength := cm.getAbsLogIndex(len(cm.raftLog))
+				cm.lastLogTerm = cm.raftLog[len(cm.raftLog)-1].Term
+				newTotalLogLength := cm.getAbsLogIndex(len(cm.raftLog) - 1)
+				savedCommitIndex := cm.commitIndex
 				cm.commitIndex = common.Min(args.LeaderCommit, newTotalLogLength)
-				dlog.Debug("... setting commitIndex=%d", cm.commitIndex)
-				// TODO: 执行新同步的日志命令
-
-				dlog.Debug("after commit to [%v]: state=%v, LeaderCommit=%+v, FollowerCommit=%+v,FileMap=%v",
-					args.LeaderEndpoint, args.LeaderCommit, cm.commitIndex, cm.FileMap)
+				cm.logger.Debug("... setting commitIndex=%d,savedCommitIndex=%v", cm.commitIndex, savedCommitIndex)
+				//  执行新同步的日志命令
+				cm.dealWithCommands(savedCommitIndex)
+				cm.logger.Debug("after commit to [%v]: state=%v, LeaderCommit=%+v, FollowerCommit=%+v,FileMap=%+v",
+					args.LeaderEndpoint, args.LeaderCommit, cm.commitIndex, cm.FileMap.Datas())
 			}
 		} else { // 数据存在问题
 			// 判断是否存在需要全量复制
@@ -645,7 +728,7 @@ func (cm *ConsensusModule) incrementalSync(args AppendEntriesArgs, reply *Append
 	return nil
 }
 
-func (cm *ConsensusModule) leaderSendAEs() {
+func (cm *ConsensusModule) leaderSendAEs(i int) {
 	cm.mu.Lock()
 	if cm.state != Leader {
 		cm.mu.Unlock()
@@ -656,7 +739,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 
 	for _, peerEndpoint := range cm.peerEndpoints {
 		if cm.server.peerClients[peerEndpoint] == nil {
-			dlog.Info("losing connection with %+v", peerEndpoint)
+			//cm.logger.Info("losing connection with %+v", peerEndpoint)
 			return
 		}
 		go func(peerEndpoint string) {
@@ -670,7 +753,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 			var entries []LogEntry
 			// 当前日志中找不到，使用全量同步，ac除计数器外可以当作全量同步的标志
 			if pervLogIndex < -1 {
-				snapShot = cm.storage.getSnapShot()
+				snapShot, _ = cm.storage.getSnapShot()
 				ac = cm.ac.Value()
 				entries = cm.raftLog
 			} else {
@@ -683,7 +766,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 				Term:           cm.currentTerm,
 				LeaderEndpoint: cm.endpoint,
 				PreLogTerm:     pervLogTerm,
-				PreLogIndex:    pervLogIndex,
+				PreLogIndex:    pervTotalLogIndex,
 				Entries:        entries,
 				LeaderCommit:   cm.commitIndex,
 				SnapShot:       snapShot,
@@ -691,15 +774,16 @@ func (cm *ConsensusModule) leaderSendAEs() {
 				LeaderPersist:  cm.persistIndex,
 				LastLogTerm:    cm.lastLogTerm,
 			}
-			dlog.Debug("sending AppendEntries to %v: ni=%d,args=%+v,pervLogIndex=%v", peerEndpoint, ni, args, pervLogIndex)
-			cm.mu.Unlock()
+			cm.logger.Debug("send num = %v", i)
+			cm.logger.Debug("sending AppendEntries to %v: ni=%d,args=%+v,pervLogIndex=%v,pervTotalLogIndex=%v", peerEndpoint, ni, args, pervLogIndex, pervTotalLogIndex)
 
+			cm.mu.Unlock()
 			var reply AppendEntriesReply
 			if err := cm.server.Call(peerEndpoint, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 				cm.mu.Lock()
 				defer cm.mu.Unlock()
 				if reply.Term > savedCurrentTerm {
-					dlog.Debug("term out of date in heartbeat reply")
+					cm.logger.Debug("term out of date in heartbeat reply")
 					cm.becomeFollower(reply.Term)
 					return
 				}
@@ -717,33 +801,35 @@ func (cm *ConsensusModule) leaderSendAEs() {
 							matchCount := 1
 							// 统计当前索引同步成功的个数
 							for _, peer := range cm.peerEndpoints {
-								if cm.matchIndex[peer] > cm.getAbsLogIndex(i) {
+								if cm.matchIndex[peer] >= cm.getAbsLogIndex(i) {
 									matchCount++
 								}
 							}
 							// 大多数节点同步成功,提交日志
-							if matchCount*2 >= len(cm.peerEndpoints) {
+							if matchCount*2 >= len(cm.peerEndpoints)+1 {
 								// 执行
 								savedCurrentCommitIndex := cm.commitIndex
 								cm.commitIndex = cm.getAbsLogIndex(i)
-								// TODO: 执行命令
-
-								dlog.Debug("Leader CommitIndex Update,commitIndex from %v to %v, FileMap=%v",
-									savedCurrentCommitIndex, cm.commitIndex, cm.FileMap)
+								// 执行命令
+								cm.dealWithCommands(savedCurrentCommitIndex)
+								cm.logger.Debug("Leader CommitIndex Update,commitIndex from %v to %v, FileMap=%+v",
+									savedCurrentCommitIndex, cm.commitIndex, cm.FileMap.Datas())
 							}
 						}
+						cm.logger.Debug("AppendEntries reply from %v success: nextIndex := %v, match := %v;commitIndex:= %d,ni=%v,entries=%v",
+							peerEndpoint, cm.nextIndex[peerEndpoint], cm.matchIndex[peerEndpoint], cm.commitIndex, ni, entries)
 						// 需要提交
 						if cm.commitIndex != savedAbsCommitIndex {
 							// 通知其他节点提交
 							cm.triggerAEChan <- struct{}{}
-							dlog.Info("leader sets commitIndex := %d", cm.commitIndex)
+							cm.logger.Info("leader sets commitIndex := %d", cm.commitIndex)
 						}
 					} else { // 失败的情况
-						dlog.Debug("AppendEntries reply from %v has conflict, reply=%v", peerEndpoint, reply)
+						cm.logger.Debug("AppendEntries reply from %v has conflict, reply=%v", peerEndpoint, reply)
 						if reply.ConflictTerm >= 0 { // 存在数据冲突
 							// 尝试在当前存在的日志中找到冲突数据位置
 							lastTermIndex := -1
-							for i := len(cm.raftLog); i >= 0; i-- {
+							for i := len(cm.raftLog) - 1; i >= 0; i-- {
 								if cm.raftLog[i].Term == reply.ConflictTerm {
 									lastTermIndex = i
 									break
@@ -759,6 +845,8 @@ func (cm *ConsensusModule) leaderSendAEs() {
 						}
 					}
 				}
+			} else {
+				//cm.logger.Warn("sending AppendEntries error,err=%v", err)
 			}
 		}(peerEndpoint)
 	}
@@ -767,10 +855,11 @@ func (cm *ConsensusModule) leaderSendAEs() {
 
 // ##################################   定时器模块   #######################################################################
 func (cm *ConsensusModule) electionTimeout() time.Duration {
+	heartbeatTimeout := common.RAFT_HEARTNBEAT_TIMEOUT
 	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
-		return time.Duration(150) * time.Millisecond
+		return time.Duration(heartbeatTimeout) * time.Millisecond
 	} else {
-		return time.Duration(150+rand.Intn(150)) * time.Millisecond
+		return time.Duration(heartbeatTimeout+rand.Intn(150)) * time.Millisecond
 	}
 }
 
@@ -780,7 +869,7 @@ func (cm *ConsensusModule) runElectionTimer() {
 	cm.mu.Lock()
 	termStarted := cm.currentTerm
 	cm.mu.Unlock()
-	dlog.Info("election timer started (%v), term=%d", timeDuration, termStarted)
+	cm.logger.Info("election timer started (%v), term=%d", timeDuration, termStarted)
 
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
@@ -789,18 +878,19 @@ func (cm *ConsensusModule) runElectionTimer() {
 		<-ticker.C
 		cm.mu.Lock()
 		if cm.state != Candidate && cm.state != Follower {
-			dlog.Info("in election timer state=%s, bailing out", cm.state)
+			cm.logger.Info("in election timer state=%s, bailing out", cm.state)
 			cm.mu.Unlock()
 			return
 		}
 		if termStarted != cm.currentTerm {
-			dlog.Info("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
+			cm.logger.Info("in election timer term changed from %d to %d, bailing out", termStarted, cm.currentTerm)
 			cm.mu.Unlock()
 			return
 		}
 		if elapsed := time.Since(cm.electionResetEvent); elapsed >= timeDuration {
-			// TODO: 开始选举
-
+			cm.logger.Info("heart timeout,start election,timeout=%v,elapsed=%v", timeDuration, elapsed)
+			// 开始选举
+			cm.startElection()
 			cm.mu.Unlock()
 			return
 		}
@@ -839,25 +929,37 @@ func (cm *ConsensusModule) persistLogTimer() {
 }
 
 // ##################################   命令模块   #######################################################################
-
+// 只会有写操作
 func (cm *ConsensusModule) dealWithCommands(savedAbsCommitIndex int) {
 	savedRefCommitIndex := cm.getRelLogIndex(savedAbsCommitIndex)
 	refCommitIndex := cm.getRelLogIndex(cm.commitIndex)
+	cm.logger.Debug("executor command from %d to %d, raftLog=%+v,persistIndex=%v",
+		savedRefCommitIndex, refCommitIndex, cm.raftLog, cm.persistIndex)
 	for i := savedRefCommitIndex + 1; i <= refCommitIndex; i++ {
-		//logEntry := cm.raftLog[i]
-		// TODO: 解析命令
-		//command :=
-		// TODO: 执行指令
-
+		logEntry := cm.raftLog[i]
+		// 解析命令
+		command, err := cm.parseCommandFromLog(logEntry)
+		if err != nil {
+			cm.logger.Error("parse command error，err=:%v", err)
+			continue
+		}
+		// 这里是执行写命令
+		_, err = cm.cp.Process(command)
+		if err != nil {
+			cm.logger.Error("execute command err, error=%v", err)
+		}
+		cm.logger.Debug("command executor success,command=%v", command)
 	}
+	cm.logger.Debug("after executor command from %d to %d, raftLog=%+v,persistIndex=%v,fileMap=%v",
+		savedRefCommitIndex, cm.commitIndex, cm.raftLog, cm.persistIndex, cm.FileMap.Datas())
 	// 计数提交指令条数，用于触发持久化
 	if cm.ac.AddAndIsTrigger(int64(cm.commitIndex - savedAbsCommitIndex)) {
 		cm.persistReadyChan <- struct{}{}
 	}
 }
 
-func (cm *ConsensusModule) parseCommandFromLog(entry LogEntry) interface{} {
-	return entry.Command
+func (cm *ConsensusModule) parseCommandFromLog(entry LogEntry) (Command, error) {
+	return entry.Command, nil
 }
 
 // ##################################   CM内部通用工具模块   #######################################################################
@@ -875,9 +977,16 @@ func (cm *ConsensusModule) getRelLogIndex(logIndex int) int {
 
 func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
 	if len(cm.raftLog) > 0 {
-		lastIndex := cm.getAbsLogIndex(len(cm.raftLog) - 1)
-		return lastIndex, cm.raftLog[lastIndex].Term
+		lastIndex := len(cm.raftLog) - 1
+		return cm.getAbsLogIndex(lastIndex), cm.raftLog[lastIndex].Term
 	} else {
-		return -1, cm.lastLogTerm
+		return cm.persistIndex, cm.lastLogTerm
 	}
+}
+
+func (cm *ConsensusModule) updateEvent() {
+	elapsed := time.Since(cm.electionResetEvent)
+	cm.electionResetEvent = time.Now()
+	timeString := cm.electionResetEvent.Format("2006-01-02 15:04:05.999")
+	cm.logger.Debug("heartbeat update, elapsed=%v,now=%v", elapsed, timeString)
 }

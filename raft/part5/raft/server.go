@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/rpc"
 	"os"
-	config "raft/part5"
+	"raft/part5/common"
+	"raft/part5/config"
+	logger "raft/part5/log"
 	"sync"
 	"time"
 )
@@ -24,13 +26,14 @@ type Server struct {
 	listener    net.Listener
 	peerClients map[string]*rpc.Client
 
-	config config.RaftConfig
+	config *config.RaftConfig
+	logger logger.Logger
 	ready  <-chan interface{}
 	quit   chan interface{}
 	wg     sync.WaitGroup
 }
 
-func NewServer(endpoint string, peerEndpoints []string, storage Storage, ready <-chan interface{}, config config.RaftConfig) *Server {
+func NewServer(endpoint string, peerEndpoints []string, storage Storage, ready <-chan interface{}, config *config.RaftConfig) *Server {
 	server := new(Server)
 	server.endpoint = endpoint
 	server.peerEndpoints = peerEndpoints
@@ -42,9 +45,18 @@ func NewServer(endpoint string, peerEndpoints []string, storage Storage, ready <
 	return server
 }
 
+var dlog = logger.DLogger
+
 func (s *Server) Serve() {
 	s.mu.Lock()
-	s.cm = NewConsensusModule(s.endpoint, s.peerEndpoints, s, s.storage, s.ready)
+	var log logger.Logger
+	if common.IsStandalone() {
+		log = dlog
+	} else {
+		log = logger.NewBasicLogger(logger.LogLevel(s.config.LogLevel), s.endpoint)
+	}
+	s.cm = NewConsensusModule(s.endpoint, s.peerEndpoints, s, s.storage, s.ready, log)
+	s.logger = log
 	s.rpcServer = rpc.NewServer()
 	s.rpcProxy = &RPCProxy{
 		cm: s.cm,
@@ -54,22 +66,22 @@ func (s *Server) Serve() {
 	var err error
 	s.listener, err = net.Listen("tcp", s.config.Endpoint)
 	if err != nil {
-		dlog.Fatal(err)
+		s.logger.Fatal(err)
 	}
-	dlog.Info("[%v] listening at %s", s.endpoint, s.listener.Addr())
+	s.logger.Info("[%v] listening at %s", s.endpoint, s.listener.Addr())
 	s.mu.Unlock()
 
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		for {
-			conn, err := s.listener.Accept()
-			if err != nil {
+			conn, errAccept := s.listener.Accept()
+			if errAccept != nil {
 				select {
 				case <-s.quit:
 					return
 				default:
-					dlog.Fatalf("accept error: %v", err)
+					s.logger.Fatalf("accept error: %v", errAccept)
 				}
 			}
 
@@ -98,7 +110,7 @@ func (s *Server) GetListenAddr() net.Addr {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.listener == nil {
-		dlog.Warn("listener is nil")
+		s.logger.Warn("listener is nil")
 		return nil
 	}
 	return s.listener.Addr()
@@ -108,8 +120,9 @@ func (s *Server) ConnectToPeer(endpoint string, addr net.Addr) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.peerClients[endpoint] == nil {
-		client, err := rpc.Dial(addr.Network(), addr.Network())
+		client, err := rpc.Dial(addr.Network(), addr.String())
 		if err != nil {
+			s.logger.Error("connect error endpoint=%v,err=%v", endpoint, err)
 			return err
 		}
 		s.peerClients[endpoint] = client
@@ -139,9 +152,10 @@ func (s *Server) DisconnectAll() {
 }
 
 func (s *Server) Shutdown() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.cm.Stop()
+	close(s.quit)
 	s.listener.Close()
+	s.logger.Info("raft Server shutdown")
 	s.wg.Wait()
 }
 
@@ -153,10 +167,10 @@ func (rpp *RPCProxy) RequestVote(args RequestVotedArgs, reply *RequestVotedReply
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
 		if dice == 9 {
-			dlog.Debug("drop RequestVote")
+			rpp.cm.logger.Debug("drop RequestVote")
 			return fmt.Errorf("RPC failed")
 		} else if dice == 8 {
-			dlog.Debug("delay RequestVote")
+			rpp.cm.logger.Debug("delay RequestVote")
 			time.Sleep(75 * time.Millisecond)
 		}
 	} else {
@@ -169,10 +183,10 @@ func (rpp *RPCProxy) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesR
 	if len(os.Getenv("RAFT_UNRELIABLE_RPC")) > 0 {
 		dice := rand.Intn(10)
 		if dice == 9 {
-			dlog.Info("drop AppendEntries")
+			rpp.cm.logger.Info("drop AppendEntries")
 			return fmt.Errorf("drop AppendEntries")
 		} else if dice == 8 {
-			dlog.Info("delay AppendEntries")
+			rpp.cm.logger.Info("delay AppendEntries")
 			time.Sleep(75 * time.Millisecond)
 		}
 	} else {

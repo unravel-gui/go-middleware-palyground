@@ -439,9 +439,10 @@ func (cm *ConsensusModule) IncrementalReplication(args AppendEntriesArgs, reply 
 		currentPreLogIndex := cm.getCurrentLogIndex(args.PrevTotalLogIndex)
 		cm.dlog("Args for Append Logs from [%v]: [args=%+v, totalLogLength=%v,currentPreLogIndex=%v,log=%+v, persistIndex=%v,lastLogTerm=%v]",
 			args.LeaderId, args, totalLogLength, currentPreLogIndex, cm.log, cm.persistIndex, cm.lastLogTerm)
+
 		if (args.PrevTotalLogIndex == -1 && args.LeaderTotalCommit == -1) || // 第一次同步
 			currentPreLogIndex == -1 || // 相对索引为-1，对应Follower节点持久化后第一次同步的情况
-			(args.PrevLogTerm == -1 && args.LastLogTerm == cm.lastLogTerm && args.PersistIndex+len(args.Entries)+1 == totalLogLength) || // PreLogTerm=-1说明这部分日志在Leader中已经被丢弃，这里只需要判断是否是提交请求即可,
+			(args.PrevTotalLogIndex < totalLogLength && args.LastLogTerm == cm.lastLogTerm && args.PersistIndex+len(args.Entries)+1 == totalLogLength) || // PreLogTerm=-1说明这部分日志在Leader中已经被丢弃，这里只需要判断是否是提交请求即可,
 			(args.PrevTotalLogIndex < totalLogLength && // 总日志层面上一次同步的索引存在
 				currentPreLogIndex >= 0 && currentPreLogIndex < len(cm.log) && // 同步位置在日志列表中
 				cm.log[currentPreLogIndex].Term == args.PrevLogTerm) { // 日志列表中任期相同，数据完全没有问题
