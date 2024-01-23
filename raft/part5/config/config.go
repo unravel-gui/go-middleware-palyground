@@ -1,35 +1,63 @@
-package config
+package conf
 
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
+	"raft/part6/common"
 )
 
-// RaftConfig 结构体用于存储Raft配置项
-type RaftConfig struct {
-	Leader   string `json:"leader"`
-	Host     string `json:"host"`
-	Port     int    `json:"port"`
-	Endpoint string
-	// 持久化
-	AcMax         int `json:"ac_max""`
-	PersisTimeout int `json:"persist_timeout"`
-	// 读取
-	Read     bool `json:"read"`
-	LogLevel int  `json:"log_level"`
+type Config struct {
+	Id         int64  `json:"id"`
+	IP         string `json:"ip"`
+	Port       int64  `json:"port"`
+	Endpoint   string
+	Pattern    string `json:"pattern"`
+	RpcConfig  `json:"rpc_config"`
+	RaftConfig `json:"raft_config"`
 }
 
-// LoadConfig 函数用于加载配置文件
-func LoadConfig(filePath string) (*RaftConfig, error) {
+type RpcConfig struct {
+	Retry            int64 `json:"retry"`
+	HeartbeatTimeout int   `json:"heartbeat_timeout"`
+}
+
+type RaftConfig struct {
+	ElectionBaseTime   int `json:"election_base_time"`
+	ElectionRandomTime int `json:"election_random_time"`
+	HeartbeatTimeout   int `json:"heartbeat_timeout"`
+}
+
+var DefaultConfig = NewConfig()
+
+func init() {
+	LoadConfig(common.DEFAULT_CONFIG_PATH)
+}
+
+func NewConfig() *Config {
+	// 默认路径
+	cfg := new(Config)
+	return cfg
+}
+
+func LoadConfig(filePath string) {
+	DefaultConfig.LoadConfig(filePath)
+}
+
+func (cfg *Config) LoadConfig(filePath string) error {
+	if !common.IsExisted(filePath) {
+		return fmt.Errorf("config file not existed,path=%v", filePath)
+	}
+
 	// 读取配置文件
-	fileContent, err := ioutil.ReadFile("leader.json")
+	file, err := os.Open(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("can't get file,err=%v", err)
+		return fmt.Errorf("open config file err:%v", err)
 	}
-	config := RaftConfig{}
-	if err := json.Unmarshal(fileContent, config); err != nil {
-		return nil, err
+	// 解析 JSON
+	if err := json.NewDecoder(file).Decode(&cfg); err != nil {
+		return fmt.Errorf("unmarshalling config err:%v", err)
 	}
-	return &config, nil
+	cfg.Endpoint = fmt.Sprintf("%s:%d", cfg.IP, cfg.Port)
+	return nil
 }

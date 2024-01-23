@@ -379,6 +379,125 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	return nil
 }
 
+// 给集群中每个节点发送心跳包(日志同步包)
+func (cm *ConsensusModule) leaderSendAEs() {
+	cm.mu.Lock()
+	// 只有Leader才会对其他节点发送心跳包以及日志同步信息
+	if cm.state != Leader {
+		cm.mu.Unlock()
+		return
+	}
+	// 记录刚开始的任期
+	savedCurrentTerm := cm.currentTerm
+	cm.mu.Unlock()
+	// 为每个节点开启协程发送心跳包
+	for _, peerId := range cm.peerIds {
+		go func(peerId int) {
+			cm.mu.Lock()
+			// 获得节点下一个等待发送的索引
+			ni := cm.nextIndex[peerId]
+			// 之前已经被接收的日志的最后一个索引
+			pervLogIndex := ni - 1
+			// 之前已经被接收的日志的最后一个任期
+			pervLogTerm := -1
+			if pervLogIndex >= 0 {
+				pervLogTerm = cm.log[pervLogIndex].Term
+			}
+			// 获得在那之后的日志数据
+			entries := cm.log[ni:]
+			// 包装成请求包
+			args := AppendEntriesArgs{
+				Term:         cm.currentTerm,
+				LeaderId:     cm.id,
+				PrevLogTerm:  pervLogTerm,
+				PrevLogIndex: pervLogIndex,
+				Entries:      entries,
+				LeaderCommit: cm.commitIndex, // 当前leader的已经提交的索引
+			}
+			cm.mu.Unlock()
+			cm.dlog("sending AppendEntries to %v: ni=%d,args=%+v", peerId, ni, args)
+			var reply AppendEntriesReply
+			// 获得请求后的内容
+			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
+				cm.mu.Lock()
+				defer cm.mu.Unlock()
+				// 返回的任期更大，说明当前节点已经落后，成为Follower
+				if reply.Term > savedCurrentTerm {
+					cm.dlog("term out of date in heartbeat reply")
+					cm.becomeFollower(reply.Term)
+					return
+				}
+				// 当前节点是Leader并且任期相同
+				if cm.state == Leader && savedCurrentTerm == reply.Term {
+					// 同步成功
+					if reply.Success {
+						// 更新下一个发送的索引
+						cm.nextIndex[peerId] = ni + len(entries)
+						// 更新已经复制成功的索引
+						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
+						// 记录当前的已提交的索引
+						savedCommitIndex := cm.commitIndex
+						// 一个个检查是否被大多数接收成功
+						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
+							// 只有任期相同的数据才是有效的
+							if cm.log[i].Term == cm.currentTerm {
+								// 统计符合的节点个数
+								matchCount := 1
+								for _, peerId := range cm.peerIds {
+									// 如果已复制的日志索引大于当前判断的日志的索引则表示当前日志位置已经被这个节点接收成功
+									if cm.matchIndex[peerId] >= i {
+										matchCount++
+									}
+								}
+								// 大多数节点接收成功，则更新当前节点(Leader端)的已提交索引
+								// 这里体现了大多数节点已经成功提交则认为提交成功
+								if matchCount*2 > len(cm.peerIds)+1 {
+									cm.commitIndex = i
+								}
+							}
+						}
+						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, match := %v;commitIndex:= %d", peerId, cm.nextIndex[peerId], cm.matchIndex, cm.commitIndex)
+						// 和原先的已提交索引进行比较，若有变化则代表有日志被集群提交
+						if cm.commitIndex != savedCommitIndex {
+							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
+							// 通过通道告知已经有日志数据被提交
+							cm.newCommitReadyChan <- struct{}{}
+							cm.triggerAEChan <- struct{}{}
+						}
+					} else { // 日志提交失败，需要修改发送日志的位置
+						// 出现冲突的任期大于等于0
+						// 表示数据存在冲突
+						if reply.ConflictTerm >= 0 {
+							// 记录这个出现冲突的索引
+							lastIndexOfTerm := -1
+							// 找出这个冲突任期的最后一条日志数据的索引
+							// 这里的冲突任期实际是正常数据的最后一个任期，这个任期之后的数据是有冲突的
+							for i := len(cm.log) - 1; i >= 0; i-- {
+								if cm.log[i].Term == reply.ConflictTerm {
+									lastIndexOfTerm = i
+									break
+								}
+							}
+							// 冲突索引存在
+							if lastIndexOfTerm >= 0 {
+								// +1后即为冲突的数据的第一位索引
+								cm.nextIndex[peerId] = lastIndexOfTerm + 1
+							} else {
+								// 更新为 记录的问题索引
+								cm.nextIndex[peerId] = reply.ConflictIndex
+							}
+						} else { // 存在数据丢失的情况
+							// 更新为 记录的问题索引
+							cm.nextIndex[peerId] = reply.ConflictIndex
+						}
+						cm.dlog("AppendEntries reply from %d success:nextIndex := %d", peerId, ni-1)
+					}
+				}
+			}
+		}(peerId)
+	}
+}
+
 // 获得超时时间
 func (cm *ConsensusModule) electionTimeout() time.Duration {
 	if len(os.Getenv("RAFT_FORCE_MORE_REELECTION")) > 0 && rand.Intn(3) == 0 {
@@ -559,125 +678,6 @@ func (cm *ConsensusModule) startLeader() {
 			}
 		}
 	}(50 * time.Millisecond)
-}
-
-// 给集群中每个节点发送心跳包(日志同步包)
-func (cm *ConsensusModule) leaderSendAEs() {
-	cm.mu.Lock()
-	// 只有Leader才会对其他节点发送心跳包以及日志同步信息
-	if cm.state != Leader {
-		cm.mu.Unlock()
-		return
-	}
-	// 记录刚开始的任期
-	savedCurrentTerm := cm.currentTerm
-	cm.mu.Unlock()
-	// 为每个节点开启协程发送心跳包
-	for _, peerId := range cm.peerIds {
-		go func(peerId int) {
-			cm.mu.Lock()
-			// 获得节点下一个等待发送的索引
-			ni := cm.nextIndex[peerId]
-			// 之前已经被接收的日志的最后一个索引
-			pervLogIndex := ni - 1
-			// 之前已经被接收的日志的最后一个任期
-			pervLogTerm := -1
-			if pervLogIndex >= 0 {
-				pervLogTerm = cm.log[pervLogIndex].Term
-			}
-			// 获得在那之后的日志数据
-			entries := cm.log[ni:]
-			// 包装成请求包
-			args := AppendEntriesArgs{
-				Term:         cm.currentTerm,
-				LeaderId:     cm.id,
-				PrevLogTerm:  pervLogTerm,
-				PrevLogIndex: pervLogIndex,
-				Entries:      entries,
-				LeaderCommit: cm.commitIndex, // 当前leader的已经提交的索引
-			}
-			cm.mu.Unlock()
-			cm.dlog("sending AppendEntries to %v: ni=%d,args=%+v", peerId, ni, args)
-			var reply AppendEntriesReply
-			// 获得请求后的内容
-			if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
-				cm.mu.Lock()
-				defer cm.mu.Unlock()
-				// 返回的任期更大，说明当前节点已经落后，成为Follower
-				if reply.Term > savedCurrentTerm {
-					cm.dlog("term out of date in heartbeat reply")
-					cm.becomeFollower(reply.Term)
-					return
-				}
-				// 当前节点是Leader并且任期相同
-				if cm.state == Leader && savedCurrentTerm == reply.Term {
-					// 同步成功
-					if reply.Success {
-						// 更新下一个发送的索引
-						cm.nextIndex[peerId] = ni + len(entries)
-						// 更新已经复制成功的索引
-						cm.matchIndex[peerId] = cm.nextIndex[peerId] - 1
-						// 记录当前的已提交的索引
-						savedCommitIndex := cm.commitIndex
-						// 一个个检查是否被大多数接收成功
-						for i := cm.commitIndex + 1; i < len(cm.log); i++ {
-							// 只有任期相同的数据才是有效的
-							if cm.log[i].Term == cm.currentTerm {
-								// 统计符合的节点个数
-								matchCount := 1
-								for _, peerId := range cm.peerIds {
-									// 如果已复制的日志索引大于当前判断的日志的索引则表示当前日志位置已经被这个节点接收成功
-									if cm.matchIndex[peerId] >= i {
-										matchCount++
-									}
-								}
-								// 大多数节点接收成功，则更新当前节点(Leader端)的已提交索引
-								// 这里体现了大多数节点已经成功提交则认为提交成功
-								if matchCount*2 > len(cm.peerIds)+1 {
-									cm.commitIndex = i
-								}
-							}
-						}
-						cm.dlog("AppendEntries reply from %d success: nextIndex := %v, match := %v;commitIndex:= %d", peerId, cm.nextIndex[peerId], cm.matchIndex, cm.commitIndex)
-						// 和原先的已提交索引进行比较，若有变化则代表有日志被集群提交
-						if cm.commitIndex != savedCommitIndex {
-							cm.dlog("leader sets commitIndex := %d", cm.commitIndex)
-							// 通过通道告知已经有日志数据被提交
-							cm.newCommitReadyChan <- struct{}{}
-							cm.triggerAEChan <- struct{}{}
-						}
-					} else { // 日志提交失败，需要修改发送日志的位置
-						// 出现冲突的任期大于等于0
-						// 表示数据存在冲突
-						if reply.ConflictTerm >= 0 {
-							// 记录这个出现冲突的索引
-							lastIndexOfTerm := -1
-							// 找出这个冲突任期的最后一条日志数据的索引
-							// 这里的冲突任期实际是正常数据的最后一个任期，这个任期之后的数据是有冲突的
-							for i := len(cm.log) - 1; i >= 0; i-- {
-								if cm.log[i].Term == reply.ConflictTerm {
-									lastIndexOfTerm = i
-									break
-								}
-							}
-							// 冲突索引存在
-							if lastIndexOfTerm >= 0 {
-								// +1后即为冲突的数据的第一位索引
-								cm.nextIndex[peerId] = lastIndexOfTerm + 1
-							} else {
-								// 更新为 记录的问题索引
-								cm.nextIndex[peerId] = reply.ConflictIndex
-							}
-						} else { // 存在数据丢失的情况
-							// 更新为 记录的问题索引
-							cm.nextIndex[peerId] = reply.ConflictIndex
-						}
-						cm.dlog("AppendEntries reply from %d success:nextIndex := %d", peerId, ni-1)
-					}
-				}
-			}
-		}(peerId)
-	}
 }
 
 // 获得最近日志数据的索引和任期

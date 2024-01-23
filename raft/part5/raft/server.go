@@ -6,57 +6,53 @@ import (
 	"net"
 	"net/rpc"
 	"os"
-	"raft/part5/common"
-	"raft/part5/config"
 	logger "raft/part5/log"
 	"sync"
 	"time"
 )
 
+var dlog = logger.GetBasicLogger()
+
 type Server struct {
-	mu            sync.Mutex
-	endpoint      string
-	peerEndpoints []string
+	mu       sync.Mutex
+	id       int64
+	endpoint string
+	servers  map[int64]string
 
 	cm      *ConsensusModule
-	storage Storage
+	persist Persister
 
-	rpcProxy    *RPCProxy
-	rpcServer   *rpc.Server
-	listener    net.Listener
-	peerClients map[string]*rpc.Client
+	rpcProxy  *RPCProxy
+	rpcServer *rpc.Server
+	listener  net.Listener
 
-	config *config.RaftConfig
 	logger logger.Logger
 	ready  <-chan interface{}
 	quit   chan interface{}
 	wg     sync.WaitGroup
 }
 
-func NewServer(endpoint string, peerEndpoints []string, storage Storage, ready <-chan interface{}, config *config.RaftConfig) *Server {
+func NewServer(endpoint string, servers map[int64]string, persist Persister, ready <-chan interface{}, config *config.RaftConfig) *Server {
 	server := new(Server)
 	server.endpoint = endpoint
-	server.peerEndpoints = peerEndpoints
-	server.peerClients = make(map[string]*rpc.Client)
-	server.storage = storage
+	server.servers = servers
+	server.persist = persist
+	server.newLogger()
 	server.ready = ready
 	server.quit = make(chan interface{})
-	server.config = config
 	return server
 }
-
-var dlog = logger.DLogger
+func (s *Server) newLogger() {
+	if config.Pattern == "standalone" {
+		s.logger = logger.NewRaftLogger(s.id, s.endpoint)
+	} else {
+		s.logger = logger.GetRaftLogger()
+	}
+}
 
 func (s *Server) Serve() {
 	s.mu.Lock()
-	var log logger.Logger
-	if common.IsStandalone() {
-		log = dlog
-	} else {
-		log = logger.NewBasicLogger(logger.LogLevel(s.config.LogLevel), s.endpoint)
-	}
-	s.cm = NewConsensusModule(s.endpoint, s.peerEndpoints, s, s.storage, s.ready, log)
-	s.logger = log
+	s.cm = NewConsensusModule(s.id, s.endpoint, s.servers, s, s.persist)
 	s.rpcServer = rpc.NewServer()
 	s.rpcProxy = &RPCProxy{
 		cm: s.cm,

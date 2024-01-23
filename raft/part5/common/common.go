@@ -1,26 +1,52 @@
 package common
 
 import (
+	"log"
 	"os"
-	"strings"
+	"path/filepath"
+	"time"
 )
 
-const RAFT_HEARTNBEAT_SEND = 50
-const RAFT_HEARTNBEAT_TIMEOUT = 250
+const (
+	DEFAULT_CONFIG_PATH     = "E:\\Code\\go\\src\\kvRaft\\conf\\kvServer.json"
+	RAFT_HEARTNBEAT_TIMEOUT = 100
+)
 
-func Min(a, b int) int {
-	if a > b {
-		return a
-	} else {
-		return b
-	}
+func SleepMs(n int) {
+	time.Sleep(10 * time.Duration(n) * time.Millisecond)
 }
 
-func IsStandalone() bool {
-	localTestValue := os.Getenv("STANDALONE")
-	if strings.ToLower(localTestValue) == "true" {
+func IsExisted(path string) bool {
+	_, err := os.Stat(path)
+	if err == nil {
 		return true
-	} else {
+	}
+	return !os.IsNotExist(err)
+}
+
+func IsDir(path string) bool {
+	fileInfo, err := os.Stat(path)
+	if err != nil {
+		log.Println("Error checking if path is directory:", err)
 		return false
 	}
+	return fileInfo.IsDir()
+}
+
+func GetFullPathName(path string) string {
+	return filepath.Clean(path)
+}
+
+func MinInt64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func MaxInt64(a, b int64) int64 {
+	if a > b {
+		return a
+	}
+	return b
 }

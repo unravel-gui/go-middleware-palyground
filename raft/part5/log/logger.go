@@ -4,98 +4,110 @@ import (
 	"fmt"
 	"log"
 	"os"
+	conf "raft/part5/config"
 	"sync"
 )
 
 type LogLevel int
+
+var config = conf.DefaultConfig
 
 const (
 	DEBUG LogLevel = iota
 	INFO
 	WARN
 	ERROR
+	CRITICAL
 	FATAL
 )
 
 // Logger 接口定义了日志组件的基本方法
 type Logger interface {
-	log(level LogLevel, format string, args ...interface{})
 	Debug(format string, args ...interface{})
 	Info(format string, args ...interface{})
 	Warn(format string, args ...interface{})
 	Error(format string, args ...interface{})
+	Critical(format string, args ...interface{})
 	Fatal(err error)
 	Fatalf(format string, args ...interface{})
-	SetLevel(flag LogLevel)
-	levelToString(level LogLevel) string
+	SetLogLevel(flag LogLevel)
 }
 
 type BasicLogger struct {
-	mu sync.Mutex
-	// 可以添加其他配置项
-	LoggerLevel LogLevel
-	endpoint    string
+	logger *log.Logger
+	level  LogLevel
 }
 
+var BLogger *BasicLogger
 var _ Logger = (*BasicLogger)(nil)
-var DLogger Logger // 全局日志对象
+var basicOnce sync.Once
 
-func NewBasicLogger(logLeverl LogLevel, endpoint string) *BasicLogger {
-	basicLogger := new(BasicLogger)
-	basicLogger.LoggerLevel = logLeverl
-	basicLogger.endpoint = endpoint
-	return basicLogger
+func GetBasicLogger() *BasicLogger {
+	basicOnce.Do(func() {
+		// TODO：读取配置
+		BLogger = newBasicLogger(0)
+	})
+	return BLogger
 }
 
-// Debug 实现了 Logger 接口的 Debug 方法
-func (l *BasicLogger) Debug(format string, args ...interface{}) {
-	if l.LoggerLevel == DEBUG {
-		l.log(DEBUG, format, args...)
+// NewBasicLogger 创建一个新的BasicLogger实例
+func newBasicLogger(level LogLevel) *BasicLogger {
+	return &BasicLogger{
+		logger: log.New(os.Stdout, "", log.LstdFlags),
+		level:  level,
 	}
 }
 
-// Info 实现了 Logger 接口的 Info 方法
-func (l *BasicLogger) Info(format string, args ...interface{}) {
-	if l.LoggerLevel <= INFO {
-		l.log(INFO, format, args...)
+// SetLogLevel 设置日志等级
+func (bl *BasicLogger) SetLogLevel(level LogLevel) {
+	bl.level = level
+}
+
+// logMessage 封装日志消息
+func (bl *BasicLogger) logMessage(level LogLevel, format string, args ...interface{}) {
+	if level >= bl.level {
+		message := fmt.Sprintf(format, args...)
+		bl.logger.Printf("[%s]: %s", level.String(), message)
 	}
 }
 
-// Warn 实现了 Logger 接口的 Warn 方法
-func (l *BasicLogger) Warn(format string, args ...interface{}) {
-	if l.LoggerLevel <= WARN {
-		l.log(WARN, format, args...)
-	}
+// Debug 打印调试信息
+func (bl *BasicLogger) Debug(format string, args ...interface{}) {
+	bl.logMessage(DEBUG, format, args...)
 }
 
-func (l *BasicLogger) Error(format string, args ...interface{}) {
-	if l.LoggerLevel <= ERROR {
-		l.log(ERROR, format, args...)
-	}
-}
-func (l *BasicLogger) Fatal(err error) {
-	if l.LoggerLevel <= FATAL {
-		l.log(FATAL, err.Error())
-		os.Exit(1)
-	}
+// Info 打印信息
+func (bl *BasicLogger) Info(format string, args ...interface{}) {
+	bl.logMessage(INFO, format, args...)
 }
 
-func (l *BasicLogger) Fatalf(format string, args ...interface{}) {
-	if l.LoggerLevel <= FATAL {
-		l.log(FATAL, format, args...)
-		os.Exit(1)
-	}
+// Warn 打印警告信息
+func (bl *BasicLogger) Warn(format string, args ...interface{}) {
+	bl.logMessage(WARN, format, args...)
 }
 
-// log 是一个内部方法，用于实际记录日志
-func (l *BasicLogger) log(level LogLevel, format string, args ...interface{}) {
-	levelStr := l.levelToString(level)
-	format = fmt.Sprintf("[%s]:  [%s] %s\n", l.endpoint, levelStr, format)
-	log.Printf(format, args...)
+// Error 打印错误信息
+func (bl *BasicLogger) Error(format string, args ...interface{}) {
+	bl.logMessage(ERROR, format, args...)
 }
 
-func (l *BasicLogger) levelToString(level LogLevel) string {
-	switch level {
+// Critical 打印严重问题信息
+func (bl *BasicLogger) Critical(format string, args ...interface{}) {
+	bl.logMessage(CRITICAL, format, args...)
+}
+
+// Fatal 打印严重问题信息
+func (bl *BasicLogger) Fatal(err error) {
+	bl.logMessage(FATAL, err.Error())
+}
+
+// Fatalf 打印严重问题信息
+func (bl *BasicLogger) Fatalf(format string, args ...interface{}) {
+	bl.logMessage(FATAL, format, args...)
+}
+
+func (l LogLevel) String() string {
+	switch l {
 	case DEBUG:
 		return "DEBUG"
 	case INFO:
@@ -104,13 +116,80 @@ func (l *BasicLogger) levelToString(level LogLevel) string {
 		return "WARN"
 	case ERROR:
 		return "ERROR"
+	case CRITICAL:
+		return "CRITICAL"
+	case FATAL:
+		return "FATAL"
 	default:
 		return "UNKNOWN"
 	}
 }
 
-func (l *BasicLogger) SetLevel(flag LogLevel) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	l.LoggerLevel = flag
+var _ Logger = (*BasicLogger)(nil)
+
+type RaftLogger struct {
+	BLogger  *BasicLogger
+	endpoint string
+	id       int64
+}
+
+var RLogger *RaftLogger
+
+var _ Logger = (*RaftLogger)(nil)
+var raftOnce sync.Once
+
+func GetRaftLogger() *RaftLogger {
+	raftOnce.Do(func() {
+		RLogger = NewRaftLogger(config.Id, config.Endpoint)
+	})
+	return RLogger
+}
+
+// NewRaftLogger 创建一个新的 RaftLogger 实例
+func NewRaftLogger(id int64, endpoint string) *RaftLogger {
+	return &RaftLogger{
+		BLogger:  GetBasicLogger(),
+		endpoint: endpoint,
+		id:       id,
+	}
+}
+
+// Debug 打印调试信息，带有节点信息
+func (rl *RaftLogger) Debug(format string, args ...interface{}) {
+	rl.BLogger.Debug(rl.getNodeMessage(format), args...)
+}
+
+// Info 打印信息，带有节点信息
+func (rl *RaftLogger) Info(format string, args ...interface{}) {
+	rl.BLogger.Info(rl.getNodeMessage(format), args...)
+}
+
+// Warn 打印警告信息，带有节点信息
+func (rl *RaftLogger) Warn(format string, args ...interface{}) {
+	rl.BLogger.Warn(rl.getNodeMessage(format), args...)
+}
+
+// Error 打印错误信息，带有节点信息
+func (rl *RaftLogger) Error(format string, args ...interface{}) {
+	rl.BLogger.Error(rl.getNodeMessage(format), args...)
+}
+
+func (rl *RaftLogger) Critical(format string, args ...interface{}) {
+	rl.BLogger.Critical(rl.getNodeMessage(format), args...)
+}
+
+func (rl *RaftLogger) Fatal(err error) {
+	rl.BLogger.Fatalf(rl.getNodeMessage(err.Error()))
+}
+
+func (rl *RaftLogger) Fatalf(format string, args ...interface{}) {
+	rl.BLogger.Fatalf(rl.getNodeMessage(format), args...)
+}
+
+func (rl *RaftLogger) SetLogLevel(level LogLevel) {
+	rl.BLogger.SetLogLevel(level)
+}
+
+func (rl *RaftLogger) getNodeMessage(format string) string {
+	return fmt.Sprintf("[Endpoint: %s, ID: %d] %s", rl.endpoint, rl.id, format)
 }
