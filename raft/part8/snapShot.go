@@ -95,7 +95,6 @@ func (s *SnapShotManager) snapNames() (snaps []string) {
 	if err != nil {
 		return
 	}
-
 	for _, file := range files {
 		// 忽略非常规文件
 		if file.Mode().IsRegular() {

@@ -1,6 +1,8 @@
 package part8
 
-import "fmt"
+import (
+	"fmt"
+)
 
 type MsgType int
 
@@ -11,7 +13,7 @@ const (
 
 type ApplyMsg struct {
 	Type    MsgType
-	Command interface{}
+	Command []byte
 	Index   int
 	Term    int
 }

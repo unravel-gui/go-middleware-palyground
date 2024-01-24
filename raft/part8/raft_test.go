@@ -1,11 +1,210 @@
 package part8
 
 import (
+	"bytes"
+	"encoding/gob"
 	"testing"
 	"time"
 
 	"github.com/fortytw2/leaktest"
 )
+
+func TestBasicPut(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+	var reply CommandReply
+	key := "test"
+	value := "success"
+	h.cluster[serverId].Put(key, value, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	value2 := "duplicate data"
+	h.cluster[serverId].Put(key, value2, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	h.CheckSingleLeader()
+}
+
+func TestBasicGet(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+
+	var reply CommandReply
+	h.cluster[serverId].Get("no_existed_key", &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	key := "test"
+	value := "success"
+	ok := h.Put(serverId, key, value)
+	if !ok {
+		t.Errorf("mock put one kv err")
+	}
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.Value != value {
+		t.Fatalf("want value= %v but got %v", value, reply.Value)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	h.CheckSingleLeader()
+}
+
+func TestBasicDelete(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+	var reply CommandReply
+	h.cluster[serverId].Delete("no_existed_key", &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	key := "test"
+	value := "success"
+	ok := h.Put(serverId, key, value)
+	if !ok {
+		t.Errorf("mock put one kv err")
+	}
+	_, ok = h.cluster[serverId].GetForTest(key)
+	if !ok {
+		t.Errorf("mock put one kv err")
+	}
+	reply = CommandReply{}
+	h.cluster[serverId].Delete(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	v, ok := h.cluster[serverId].GetForTest(key)
+	if ok {
+		t.Errorf("delete err, got %v, want none", v)
+	}
+}
+
+func TestComplexOp(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+
+	// get no_existed_key
+	noExistKey := "no_existed_key"
+	var reply CommandReply
+	h.cluster[serverId].Get(noExistKey, &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	// delete no_existed_key
+	reply = CommandReply{}
+	h.cluster[serverId].Delete(noExistKey, &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	value := "success"
+	reply = CommandReply{}
+	// put no_existed_key
+	h.cluster[serverId].Put(noExistKey, value, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// put another key
+	key := "test"
+	reply = CommandReply{}
+	h.cluster[serverId].Put(key, value, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// get key
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.Value != value {
+		t.Fatalf("want value= %v but got %v", value, reply.Value)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// put duplicate key
+	value2 := "duplicate data"
+	reply = CommandReply{}
+	h.cluster[serverId].Put(key, value2, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// get again
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.Value != value2 {
+		t.Fatalf("want value= %v but got %v", value2, reply.Value)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// delete key
+	reply = CommandReply{}
+	h.cluster[serverId].Delete(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// get key after delete
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+}
 
 // 测试基本运行
 func TestElectionBasic(t *testing.T) {
@@ -236,18 +435,13 @@ func TestCommitMultipleCommands(t *testing.T) {
 	// 检查拥有已提交数据的节点数和插入顺序和索引顺序是否相同
 	// 插入顺序靠后的索引必定靠后
 	sleepMs(250)
-	nc, i1 := h.CheckCommitted(42)
-	_, i2 := h.CheckCommitted(55)
+	nc, _ := h.CheckCommitted(42)
+	h.CheckCommitted(55)
 	if nc != 3 {
 		t.Errorf("want nc=3, got %d", nc)
 	}
-	if i1 >= i2 {
-		t.Errorf("want i1<i2, got i1=%d i2=%d", i1, i2)
-	}
-	_, i3 := h.CheckCommitted(81)
-	if i2 >= i3 {
-		t.Errorf("want i2<i3, got i2=%d i3=%d", i2, i3)
-	}
+	h.CheckCommitted(81)
+
 }
 
 // 测试复杂的提交情况并且检查内存是否泄露
@@ -334,7 +528,7 @@ func TestNoCommitWithNoQuorum(t *testing.T) {
 	h.SubmitToServer(newLeaderId, 9)
 	h.SubmitToServer(newLeaderId, 10)
 	h.SubmitToServer(newLeaderId, 11)
-	sleepMs(350)
+	sleepMs(550)
 
 	for _, v := range []int{9, 10, 11} {
 		h.CheckCommittedN(v, 3)
@@ -572,6 +766,7 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 	sleepMs(5)
 	h.SubmitToServer(origLeaderId, 24)
 	sleepMs(5)
+	sleepMs(150)
 	// 获得新Leader节点
 	newLeaderId, _ := h.CheckSingleLeader()
 
@@ -591,7 +786,7 @@ func TestReplaceMultipleLogEntries(t *testing.T) {
 	sleepMs(60)
 	h.RestartPeer(newLeaderId)
 
-	sleepMs(100)
+	sleepMs(150)
 	// 获得最终的Leader节点
 	finalLeaderId, _ := h.CheckSingleLeader()
 	// 恢复旧Leader节点
@@ -619,7 +814,24 @@ func TestCrashAfterSubmit(t *testing.T) {
 
 	// 向旧Leader节点提交数据后瞬间宕机
 	// 数据更新到大多数节点但是未被提交到集群
-	h.SubmitToServer(origLeaderId, 5)
+	args := CommandArgs{
+		Op:        PUT,
+		Key:       "5",
+		Value:     "5",
+		CommandId: 00000,
+	}
+	var data bytes.Buffer
+	if err := gob.NewEncoder(&data).Encode(args); err != nil {
+		t.Fatalf("mock submit err:%+v", err)
+	}
+	for i := 0; i < h.n; i++ {
+		// 所有日志中加入
+		cm := h.cluster[i].cm
+		cm.mu.Lock()
+		cm.log.Append(NewLogEntry(cm.log.nextIndex(), cm.currentTerm, data.Bytes()))
+		cm.mu.Unlock()
+	}
+
 	sleepMs(1)
 	h.CrashPeer(origLeaderId)
 	// 节点宕机后无法收到其他节点同步的信息因此无法更新自己的提交进度

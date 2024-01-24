@@ -14,10 +14,10 @@ type RaftLog struct {
 	MaxNextEntriesSize int
 }
 
-func (rl *RaftLog) String() string {
+func (rl *RaftLog) GoString() string {
 	// 使用 fmt.Sprintf 格式化 RaftLog 的字符串表示
-	return fmt.Sprintf("RaftLog{Entries: %+v, CommitIndex: %d, Applied: %d, MaxNextEntriesSize: %d}",
-		rl.Entries, rl.CommitIndex, rl.Applied, rl.MaxNextEntriesSize)
+	return fmt.Sprintf("RaftLog{Entries: %+v, CommitIndex: %d, Applied: %d}",
+		rl.Entries, rl.CommitIndex, rl.Applied)
 }
 
 func NewRaftLog(storage *Storage, maxNextEntriesSize int) *RaftLog {
@@ -33,10 +33,12 @@ func NewRaftLog(storage *Storage, maxNextEntriesSize int) *RaftLog {
 		rl.Entries = append(rl.Entries, LogEntry{Term: 0, Index: 0, Command: nil})
 		//rl.Entries = make([]LogEntry, 0)
 		rl.CommitIndex = 0
+		rl.Applied = 0
 	} else {
 		// 存在runtime data
 		rl.Entries = rs.Logs
 		rl.CommitIndex = rs.CommitIndex
+		rl.Applied = rl.lastSnapshotIndex()
 	}
 
 	if maxNextEntriesSize == 0 {
@@ -96,35 +98,53 @@ func (rl *RaftLog) getRelIndex(index int) int {
 // 判断给定的日志和实际日志是否相符
 func (rl *RaftLog) matchLog(prevIndex, prevLogTerm int) bool {
 	off := rl.lastSnapshotIndex()
-	if prevIndex > off {
+	if prevIndex < off {
 		return false
 	}
 	relIndex := prevIndex - off
-	return rl.Entries[relIndex].Index == prevIndex && rl.Entries[relIndex].Term == prevLogTerm
+	ent := rl.Entries[relIndex]
+	return ent.Index == prevIndex && ent.Term == prevLogTerm
 }
 
-func (rl *RaftLog) createSnapShot(index int, data []byte) *SnapShot {
+func (rl *RaftLog) createSnapShot(snapIndex int, data []byte) *SnapShot {
 	// 不在可持久化的范围内
-	if index < rl.firstIndex() || index > rl.CommitIndex || index > rl.lastIndex() {
-		return nil
-	}
-	off := rl.firstIndex()
-	snapTerm := rl.term(index - off)
-	snap := NewSnapShot(index, snapTerm, data)
+	snapTerm := rl.term(snapIndex)
+	snap := NewSnapShot(snapIndex, snapTerm, data)
 	return snap
 }
 
 func (rl *RaftLog) compact(compactIndex int) bool {
-	off := rl.firstIndex()
+	off := rl.lastSnapshotTerm()
+	index := compactIndex - off
 	// 没有可压缩的日志,或者超出范围
-	if compactIndex <= off || compactIndex > rl.lastIndex() {
+	if index <= 0 || index >= rl.size() {
 		return false
 	}
-	index := compactIndex - off
-	rl.Entries = rl.Entries[:index]
+	rl.Entries = rl.Entries[index:]
 	// 预留一位
 	rl.Entries[0].Command = nil
+	fmt.Printf("compact to Index:%d, log=%+v\n", compactIndex, rl.Entries)
 	return true
+}
+
+// 获得增量部分的日志
+func (rl *RaftLog) nextEntries(ni int) []LogEntry {
+	off := rl.lastSnapshotIndex()
+	// 还没有数据
+	// 不再当前日志范围内
+	if ni <= off || ni >= rl.nextIndex() {
+		return nil
+	}
+	index := ni - off
+	return rl.Entries[index:]
+}
+
+func (rl *RaftLog) nextApplyEntries() []LogEntry {
+	off := rl.lastSnapshotIndex()
+	lastApplied := rl.Applied
+	lastCommitIndex := rl.CommitIndex
+
+	return rl.Entries[lastApplied-off+1 : lastCommitIndex-off+1]
 }
 
 //

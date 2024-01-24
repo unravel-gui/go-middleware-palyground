@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -69,12 +70,8 @@ func NewHarness(t *testing.T, n int) *Harness {
 	alive := make([]bool, n)
 	commitChans := make([]chan ApplyMsg, n)
 	commits := make([][]ApplyMsg, n)
-	ready := make(chan interface{})
 	storage := make([]*Storage, n)
 	timestamp := time.Now().Format("2006-01-02_15-04-05.000")
-	//go func() {
-	//	http.ListenAndServe("localhost:6060", nil)
-	//}()
 	// 初始化每个节点的内容
 	for i := 0; i < n; i++ {
 		// 计算当前节点的其他节点列表
@@ -92,7 +89,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 		}
 		commitChans[i] = make(chan ApplyMsg)
 		// 新建raft服务器
-		ns[i] = NewServer(i, GetEndpoint(i), peerIds, storage[i], ready, commitChans[i])
+		ns[i] = NewServer(i, GetEndpoint(i), peerIds, storage[i])
 		// 启动raft服务
 		ns[i].Serve()
 		alive[i] = true
@@ -109,7 +106,6 @@ func NewHarness(t *testing.T, n int) *Harness {
 	}
 	// 关闭ready channel会发送一个信息到chan中
 	// 告知监听ready channel的协程已经准备好了
-	close(ready)
 	// 统统装入Harness中
 	h := &Harness{
 		cluster:     ns,
@@ -204,11 +200,9 @@ func (h *Harness) RestartPeer(id int) {
 		}
 	}
 	// 重新开启节点的任务和节点的数据
-	ready := make(chan interface{})
-	h.cluster[id] = NewServer(id, GetEndpoint(id), peerIds, h.storage[id], ready, h.commitChans[id])
+	h.cluster[id] = NewServer(id, GetEndpoint(id), peerIds, h.storage[id])
 	h.cluster[id].Serve()
 	h.ReconnectPeer(id)
-	close(ready)
 	h.alive[id] = true
 	sleepMs(20)
 }
@@ -257,54 +251,27 @@ func (h *Harness) CheckSingleLeader() (int, int) {
 func (h *Harness) CheckCommitted(cmd int) (nc, index int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	// 保存已提交数据的长度
-	commitsLen := -1
-	// 检查每个节点的已提交数据长度是否相同
+	// 计算存在这条数据的节点的个数
+	vv := ""
+	index = -1
+	nc = 0
 	for i := 0; i < h.n; i++ {
-		if h.connected[i] { // 节点存在连接
-			if commitsLen >= 0 {
-				if len(h.commits[i]) != commitsLen {
-					h.t.Fatalf("commits[%d] = %+v, commitsLen= %d", i, h.commits[i], commitsLen)
-				}
+		if h.connected[i] {
+			v, ok := h.cluster[i].GetForTest(strconv.Itoa(cmd))
+			if !ok {
+				h.t.Errorf("Node[%v] lost data [%v]", i, cmd)
+			} else if index != -1 && vv != v {
+				h.t.Errorf("got cmd[%v] diff:Node[%v]:%v  Node[%v]: %v", cmd, i, v, index, vv)
 			} else {
-				commitsLen = len(h.commits[i])
+				vv = v
+				index = i
+				nc++
 			}
 		}
 	}
-	// 检查每个已提交的数据
-	for c := 0; c < commitsLen; c++ {
-		cmdAtc := -1
-		// 检查每个节点相同索引的数据是否相同
-		for i := 0; i < h.n; i++ {
-			if h.connected[i] {
-				cmdOfN := h.commits[i][c].Command.(int)
-				if cmdAtc >= 0 {
-					if cmdOfN != cmdAtc {
-						h.t.Fatalf("got %d, want %d at h.commits[%d][%d]", cmdOfN, cmdAtc, i, c)
-					}
-				} else {
-					cmdAtc = cmdOfN
-				}
-			}
-		}
-		// 如果是指定的已提交数据则判断这条数据在每个节点中的日志索引是否相同
-		// 计算存在这条数据的节点的个数
-		if cmdAtc == cmd {
-			index := -1
-			nc := 0
-			for i := 0; i < h.n; i++ {
-				if h.connected[i] {
-					if index >= 0 && h.commits[i][c].Index != index {
-						h.t.Errorf("got Index=%d, want %d at h.commits[%d][%d]", h.commits[i][c].Index, index, i, c)
-					} else {
-						index = h.commits[i][c].Index
-					}
-					nc++
-				}
-			}
-			// 返回存在这条数据的节点数和索引
-			return nc, index
-		}
+	if nc != 0 {
+		// 返回存在这条数据的节点数和索引
+		return nc, index
 	}
 	// 找不到返回-1
 	h.t.Errorf("cmd=%d not found in commits", cmd)
@@ -313,6 +280,7 @@ func (h *Harness) CheckCommitted(cmd int) (nc, index int) {
 
 // CheckCommittedN 检查提交的节点数据并且节点数是否正确
 func (h *Harness) CheckCommittedN(cmd int, n int) {
+	tlog("CheckCommittedN, cmd=%v", cmd)
 	nc, _ := h.CheckCommitted(cmd)
 	if nc != n {
 		h.t.Errorf("CheclCommitedN got nc=%d, want %d", nc, n)
@@ -327,22 +295,62 @@ func (h *Harness) CheckNotCommitted(cmd int) {
 	// 检查所有节点
 	for i := 0; i < h.n; i++ {
 		if h.connected[i] { // 节点如果连接
-			// 检查当前节点每个数据
-			for c := 0; c < len(h.commits[i]); c++ {
-				gotCmd := h.commits[i][c].Command.(int)
-				// 如果存在指定数据则报错
-				if gotCmd == cmd {
-					h.t.Errorf("found %d at commits[%d][%d], expected none", cmd, i, c)
-				}
+			v, ok := h.cluster[i].GetForTest(strconv.Itoa(cmd))
+			if ok {
+				h.t.Errorf("found cmd:%d at Node[%v], expected none,reply=%+v", cmd, i, v)
 			}
 		}
 	}
 }
 
 // SubmitToServer 提交数据到指定的节点
-func (h *Harness) SubmitToServer(serverId int, cmd interface{}) bool {
-	_, ok := h.cluster[serverId].cm.Submit(cmd)
-	return ok
+func (h *Harness) SubmitToServer(serverId, cmd int) bool {
+	tlog("Submit cmd=%v to Node[%v]", cmd, serverId)
+	var reply CommandReply
+	cmdStr := strconv.Itoa(cmd)
+	h.cluster[serverId].Put(cmdStr, cmdStr, &reply)
+	if reply.CmdStatus != OK {
+		tlog("submit err, cmd=%+v, reply=%+v,", cmdStr, reply)
+		return false
+	}
+	tlog("reply:%v", reply)
+	return true
+}
+
+func (h *Harness) Get(serverId int, key string) bool {
+	tlog("Get Key= %v to Node[%v]", key, serverId)
+	var reply CommandReply
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != OK {
+		tlog("Get ERROR Key= %v to Node[%v], reply=%+v", key, serverId, reply)
+		return false
+	}
+	tlog("reply:%v", reply)
+	return true
+}
+
+func (h *Harness) Put(serverId int, key, value string) bool {
+	tlog("Put Key:Value= (%v:%v) to Node[%v]", key, value, serverId)
+	var reply CommandReply
+	h.cluster[serverId].Put(key, value, &reply)
+	if reply.CmdStatus != OK {
+		tlog("Put ERROR Key:Value= (%v:%v) to Node[%v], reply=%+v", key, value, serverId, reply)
+		return false
+	}
+	tlog("reply:%v", reply)
+	return true
+}
+
+func (h *Harness) Delete(serverId int, key string) bool {
+	tlog("Delete Key= %v to Node[%v]", key, serverId)
+	var reply CommandReply
+	h.cluster[serverId].Delete(key, &reply)
+	if reply.CmdStatus != OK {
+		tlog("Delete ERROR Key= %v to Node[%v], reply=%+v", key, serverId, reply)
+		return false
+	}
+	tlog("reply:%v", reply)
+	return true
 }
 
 // 封装打印日志
