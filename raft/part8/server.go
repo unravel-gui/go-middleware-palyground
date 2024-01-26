@@ -37,9 +37,10 @@ type Server struct {
 	endpoint string
 	peerIds  map[int]string // 其他节点Id列表
 
-	cm       *ConsensusModule // 共识模块
-	storage  *Storage         // 存储
-	rpcProxy *RPCProxy        // rpc代理，本质是再共识模块的基础上封装一层功能
+	cm           *ConsensusModule // 共识模块
+	storage      *Storage         // 存储
+	rpcProxy     *RPCProxy        // rpc代理，本质是再共识模块的基础上封装一层功能
+	commandProxy *CommandProxy
 
 	rpcServer *rpc.Server  // rpc服务器对象，用于提供rpc服务
 	listener  net.Listener // 当前raft服务器的监听器
@@ -53,9 +54,9 @@ type Server struct {
 	lastOperation OperationCache
 	maxRaftState  int
 
-	ready <-chan interface{} // 用于通知服务是否准备好启动
-	quit  chan interface{}   // 用于通知服务是否准备好关闭
-	wg    sync.WaitGroup     // 用于等待其他协程结束
+	ready    <-chan interface{} // 用于通知服务是否准备好启动
+	shutdown *common.AtomicBool // 标记服务器是否关闭
+	wg       sync.WaitGroup     // 用于等待其他协程结束
 }
 
 func NewServer(serverId int, endpoint string, peerIds map[int]string, storage *Storage) *Server {
@@ -71,13 +72,12 @@ func NewServer(serverId int, endpoint string, peerIds map[int]string, storage *S
 	s.storage = storage
 	s.maxRaftState = 500
 	s.applyChan = make(chan ApplyMsg)
-	s.quit = make(chan interface{})
+	s.shutdown = common.NewAtomicBool(false)
 	return s
 }
 
 // Serve 启动服务器
 func (s *Server) Serve() {
-	s.mu.Lock()
 	// 创建共识模块
 	s.cm = NewConsensusModule(s.serverId, s.peerIds, s, s.storage, s.applyChan)
 	// 创建rpc服务器(开启RPC服务)
@@ -86,7 +86,8 @@ func (s *Server) Serve() {
 	s.rpcProxy = &RPCProxy{Cm: s.cm}
 	// 将共识模块注册到服务中(共识模块中的拉票以及同步日志服务)
 	s.RegisterName("ConsensusModule", s.rpcProxy)
-
+	s.commandProxy = &CommandProxy{s: s}
+	s.RegisterName("Command", s.commandProxy)
 	var err error
 	// 创建监听器
 	s.listener, err = net.Listen("tcp", s.endpoint)
@@ -94,7 +95,6 @@ func (s *Server) Serve() {
 		log.Fatal(err)
 	}
 	log.Printf("[%v] listening at %s", s.serverId, s.listener.Addr())
-	s.mu.Unlock()
 	// 用于下面的监听逻辑
 	s.wg.Add(1)
 
@@ -105,20 +105,18 @@ func (s *Server) Serve() {
 			// 获得连接对象
 			conn, err := s.listener.Accept()
 			// 出其他错误外，监听器关闭时，也会抛出错误
-			if err != nil {
-				select {
-				case <-s.quit: // 监听退出 channel，可以得知服务是否关闭
-					return
-				default: // 服务未被告知退出，则打印异常信息
-					log.Fatal("accept error:", err)
-				}
+			if s.isStop() {
+				s.dlog("[shutdown] rpc is down...")
+				return
 			}
-			// 未新开的附属协程+1
+			if err != nil {
+				log.Fatal("accept error:", err)
+			}
+			s.dlog("[RPC] get conn:%+v \n", conn)
 			s.wg.Add(1)
 			go func() {
 				// 处理连接
 				s.rpcServer.ServeConn(conn)
-				// 标记任务完成
 				s.wg.Done()
 			}()
 		}
@@ -127,50 +125,71 @@ func (s *Server) Serve() {
 	go s.applier()
 }
 
+func (s *Server) isStop() bool {
+	return s.shutdown.Get()
+}
+
 // Shutdown 关闭服务器
 func (s *Server) Shutdown() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	// 关闭共识模块
 	s.cm.Stop()
+
+	s.shutdown.Set(true)
+	s.listener.Close()
+	// 清除未使用的chan
 	for _, replies := range s.nofiyChans {
 		close(replies)
 	}
-	// 这里必须先关闭 quit channel，再关闭监听器
-	// 关闭监听器后Accept函数会报错，然后才会进入到监听quit channel的退出逻辑
-	// 相反则会打印报错,在第二次监听后在退出(不够优雅)
-	close(s.quit)
-	s.listener.Close()
-	close(s.applyChan)
+	s.mu.Unlock()
 	s.wg.Wait()
 }
+
 func (s *Server) RegisterName(service string, obj any) {
 	s.rpcServer.RegisterName(service, obj)
 }
 
 // DisconnectAll 断开所有连接(断开所有节点的客户端)
 func (s *Server) DisconnectAll() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for id := range s.peerClients {
 		if s.peerClients[id] != nil {
 			s.peerClients[id].Close()
 			s.peerClients[id] = nil
 		}
 	}
+	s.peerClients = make(map[int]*rpc.Client, 0)
 }
 
 // ConnectToPeer 连接指定节点(获得指定节点的客户端)
 func (s *Server) ConnectToPeer(peerId int, addr string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.peerClients[peerId] == nil {
+		s.mu.Unlock()
 		client, err := rpc.Dial("tcp", addr)
 		if err != nil {
 			return err
 		}
+		s.mu.Lock()
 		s.peerClients[peerId] = client
+		s.mu.Unlock()
 	}
+	return nil
+}
+
+func (s *Server) ReConnectToPeer(peerId int) error {
+	s.mu.Lock()
+	endpoint := s.peerIds[peerId]
+	s.mu.Unlock()
+	if endpoint == "" {
+		return nil
+	}
+	client, err := rpc.Dial("tcp", endpoint)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.peerClients[peerId] = client
+	s.mu.Unlock()
 	return nil
 }
 
@@ -180,19 +199,55 @@ func (s *Server) DisconnectPeer(peerId int) error {
 	defer s.mu.Unlock()
 	if s.peerClients[peerId] != nil {
 		err := s.peerClients[peerId].Close()
-		s.peerClients[peerId] = nil
+		delete(s.peerClients, peerId)
 		return err
 	}
 
 	return nil
 }
 
+func (s *Server) connect(peerId int) (*rpc.Client, error) {
+	if peer, exists := s.peerClients[peerId]; exists {
+		return peer, nil
+	}
+	// 服务停止关闭自动连接
+	if s.isStop() {
+		return nil, nil
+	}
+	// 是否设置关闭自动连接
+	if len(os.Getenv("RaftServerTest")) > 0 {
+		return nil, nil
+	}
+
+	s.dlog("try to connect Node[%v]", peerId)
+	var client *rpc.Client
+	var err error
+	// 尝试连接
+	for i := 0; i < 3; i++ {
+		client, err = rpc.Dial("tcp", s.peerIds[peerId])
+		if err == nil {
+			s.peerClients[peerId] = client
+			return client, nil
+		}
+	}
+	s.dlog("lost connect with Node[%v]", peerId)
+	return nil, err
+}
+
 // Call 远程调用指定节点的服务
 func (s *Server) Call(id int, serviceMethod string, args interface{}, reply interface{}) error {
+	// 如果程序已经停止则停止远程调用
+	if s.isStop() {
+		return nil
+	}
 	s.mu.Lock()
-	peer := s.peerClients[id]
-	//s.cm.dlog("Node[%v] call Node[%v].%s", s.cm.id, id, serviceMethod)
+	peer, err := s.connect(id)
 	s.mu.Unlock()
+	if err != nil {
+		s.dlog("connect to Node[%v] err:%+v", id, err)
+		return err
+	}
+	//s.cm.dlog("Node[%v] call Node[%v].%s", s.cm.id, id, serviceMethod)
 	if peer == nil {
 		return fmt.Errorf("call client %d after it's closed", id)
 	} else {
@@ -204,21 +259,25 @@ func (s *Server) Report() (int, int, bool) {
 	return s.cm.Report()
 }
 
+func (s *Server) GetState() CMState {
+	return s.cm.GetState()
+}
+
 func (s *Server) GetLeaderId() int {
 	return s.cm.GetLeaderId()
 }
 
-func (s *Server) Get(key string, reply *CommandReply) {
+func (s *Server) Get(key string, reply *CommandReply) error {
 	args := CommandArgs{
 		Op:        GET,
 		Key:       key,
 		CommandId: idGenerator.GenerateID(),
 	}
 	s.handleCommand(args, reply)
+	return nil
 }
 
-// Put is a method of Server to perform the PUT operation.
-func (s *Server) Put(key, value string, reply *CommandReply) {
+func (s *Server) Put(key, value string, reply *CommandReply) error {
 	args := CommandArgs{
 		Op:        PUT,
 		Key:       key,
@@ -226,15 +285,17 @@ func (s *Server) Put(key, value string, reply *CommandReply) {
 		CommandId: idGenerator.GenerateID(),
 	}
 	s.handleCommand(args, reply)
+	return nil
 }
 
-func (s *Server) Delete(key string, reply *CommandReply) {
+func (s *Server) Delete(key string, reply *CommandReply) error {
 	args := CommandArgs{
 		Op:        DELETE,
 		Key:       key,
 		CommandId: idGenerator.GenerateID(),
 	}
 	s.handleCommand(args, reply)
+	return nil
 }
 
 func (s *Server) Clear(reply *CommandReply) {
@@ -244,19 +305,17 @@ func (s *Server) Clear(reply *CommandReply) {
 	}
 	s.handleCommand(args, reply)
 }
+func (s *Server) HandleCommand(args CommandArgs, reply *CommandReply) error {
+	s.dlog("local execute from http server,args=%+v", args)
+	defer s.dlog("local execute reply is %+v", reply)
+	return s.handleCommand(args, reply)
+}
 
 func (s *Server) handleCommand(args CommandArgs, reply *CommandReply) error {
 	defer func() {
 		s.dlog("Node[%d] processes CommandArgs %+v with CommandReply %+v\n", s.serverId, args, reply)
 	}()
 
-	s.mu.Lock()
-	// 写操作，并且是重复请求则返回缓存
-	if args.Op != GET && s.isDuplicateargs(args.ClientId, args.CommandId) {
-		*reply = s.lastOperation[args.ClientId].Reply
-		return nil
-	}
-	s.mu.Unlock()
 	// 写入集群日志
 	logIndex, ok := s.Submit(args)
 	if !ok {
@@ -290,7 +349,6 @@ func (s *Server) handleCommand(args CommandArgs, reply *CommandReply) error {
 func (s *Server) applier() {
 	for msg := range s.applyChan {
 		s.mu.Lock()
-
 		s.dlog("Node[%d] tries to apply message %+v\n", s.serverId, msg)
 
 		switch msg.Type {
@@ -320,19 +378,8 @@ func (s *Server) applier() {
 				return
 			}
 			var reply CommandReply
-			// 重复写请求处理
-			if args.Op != GET && s.isDuplicateargs(args.ClientId, args.CommandId) {
-				s.dlog("Node[%d] doesn't apply duplicated message %+v to stateMachine because maxAppliedCommandId is %+v for client %d\n",
-					s.serverId, args, s.lastOperation[args.ClientId].Reply, args.ClientId)
-				reply = s.lastOperation[args.ClientId].Reply
-			} else {
-				// 应用到状态机
-				s.applyLogToStateMachine(args, &reply)
-				// 记录写请求操作
-				if args.Op != GET {
-					s.lastOperation[args.ClientId] = NewOpRecord(args.CommandId, reply)
-				}
-			}
+			// 应用到状态机
+			s.applyLogToStateMachine(args, &reply)
 			// 获得当前raft集群状态
 			_, term, isLeader := s.cm.Report()
 			if isLeader && msg.Term == term { // 是当前任期的Leader操作
@@ -348,10 +395,10 @@ func (s *Server) applier() {
 			}
 		default:
 			s.dlog("Unexpected ApplyMsg type: %d, index: %d, term: %d\n", msg.Type, msg.Index, msg.Term)
+			s.mu.Unlock()
 			os.Exit(-1)
 		}
 		s.mu.Unlock()
-
 	}
 }
 

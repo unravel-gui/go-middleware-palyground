@@ -2,6 +2,7 @@ package part8
 
 import (
 	"fmt"
+	"log"
 	"math/rand"
 	"os"
 	"time"
@@ -11,7 +12,6 @@ import (
 // 对共识模块进一步封装，可以增加一些额外功能，如: 模拟网络不稳定等
 type RPCProxy struct {
 	Cm *ConsensusModule
-	s  *Server
 }
 
 // RequestVote 处理拉票请求
@@ -63,4 +63,14 @@ func (rpp *RPCProxy) InstallSnapShot(args InstallSnapshotArgs, reply *InstallSna
 		time.Sleep(time.Duration(1+rand.Intn(5)) * time.Millisecond)
 	}
 	return rpp.Cm.InstallSnapShot(args, reply)
+}
+
+type CommandProxy struct {
+	s *Server
+}
+
+func (cp *CommandProxy) HandleCommand(args CommandArgs, reply *CommandReply) error {
+	log.Printf("rpc args:=%v", args)
+	defer log.Printf("rpc raft server command reply=%+v", reply)
+	return cp.s.handleCommand(args, reply)
 }

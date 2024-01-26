@@ -30,8 +30,6 @@ func (err CmdStatus) String() string {
 		str = "Wrong Leader"
 	case TIMEOUT:
 		str = "Timeout"
-	case CLOSED:
-		str = "Closed"
 	default:
 		str = "Unexpect CmdStatus"
 	}

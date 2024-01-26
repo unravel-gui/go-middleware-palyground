@@ -132,19 +132,24 @@ func (cm *ConsensusModule) Report() (id int, term int, isLeader bool) {
 	defer cm.mu.Unlock()
 	return cm.id, cm.currentTerm, cm.state == Leader
 }
+func (cm *ConsensusModule) GetState() CMState {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	return cm.state
+}
 func (cm *ConsensusModule) persist(snap *SnapShot) {
 	rs := NewRuntimeState(cm.currentTerm, cm.votedFor, cm.log.CommitIndex)
 	if len(cm.log.Entries) > 0 {
 		rs.Logs = cm.log.Entries
 	}
 	cm.storage.Persist(rs, snap)
-	cm.dlog("persist done,log=%+v", cm.log)
+	cm.dlog("persist done,log=%+v", cm.log.GoString())
 }
 
 // Submit 提交数据,返回是否是leader
 func (cm *ConsensusModule) Submit(command []byte) (int, bool) {
 	cm.mu.Lock()
-	cm.dlog("Submit received by %v: %v", cm.state, command)
+	cm.dlog("Submit received by %v, leaderId=%v, cmd=%v", cm.state, cm.LeaderId, command)
 	// 只有Leader节点可以接收提交操作
 	if cm.state == Leader {
 		// 添加数据
@@ -165,6 +170,7 @@ func (cm *ConsensusModule) Submit(command []byte) (int, bool) {
 func (cm *ConsensusModule) GetLeaderId() int {
 	cm.mu.Lock()
 	defer cm.mu.Unlock()
+	cm.dlog("get LeaderId= %v", cm.LeaderId)
 	return cm.LeaderId
 }
 
@@ -181,7 +187,14 @@ func (cm *ConsensusModule) Stop() {
 }
 
 func (cm *ConsensusModule) dlog(format string, args ...interface{}) {
-	if DebugCM > 0 {
+	logOpen := false
+	debug := os.Getenv("DebugCM")
+	if debug == "" {
+		logOpen = DebugCM > 0
+	} else {
+		logOpen = debug == "true"
+	}
+	if logOpen {
 		format = fmt.Sprintf("[%d] ", cm.id) + format
 		log.Printf(format, args...)
 	}
@@ -212,7 +225,8 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	}
 	// 获得最新的数据状态
 	lastLogIndex, lastLogTerm := cm.log.lastIndex(), cm.log.lastTerm()
-	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]", args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
+	cm.dlog("RequestVote: %+v [currentTerm=%d, votedFor=%d, log index/term=(%d, %d)]",
+		args, cm.currentTerm, cm.votedFor, lastLogIndex, lastLogTerm)
 	// 对方任期更高，成为Follower,会更新任期，投票等信息
 	if args.Term > cm.currentTerm {
 		cm.dlog("... term out of date in RequestVote")
@@ -238,7 +252,7 @@ func (cm *ConsensusModule) RequestVote(args RequestVoteArgs, reply *RequestVoteR
 	reply.Term = cm.currentTerm
 	reply.LeaderId = cm.LeaderId
 	// 持久化内存中的log
-	cm.persist(nil)
+	go cm.persist(nil)
 	cm.dlog("... RequestVote reply: %+v", reply)
 	return nil
 }
@@ -266,10 +280,9 @@ type AppendEntriesReply struct {
 func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEntriesReply) error {
 	cm.mu.Lock()
 	defer func() {
-		reply.Term = cm.currentTerm
-		reply.LeaderId = cm.LeaderId
-		cm.persist(nil)
+		cm.dlog("AppendEntries reply to Node[%v]: %+v", args.LeaderId, *reply)
 		cm.mu.Unlock()
+		cm.persist(nil)
 	}()
 	// 死亡节点无需处理
 	if cm.state == Dead {
@@ -301,11 +314,14 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	// 当前节点是收到Leader的日志同步包，所以需要更新心跳时间
 	cm.resetElectionEvent()
 	cm.LeaderId = args.LeaderId
+	cm.dlog("Set LeaderId=%v", args.LeaderId)
 	reply.Success = false
 	lastSnapshotIndex := cm.log.lastSnapshotIndex()
 	// 上次同步内容在这里已经被持久化,但是leader的日志是最新的
 	// 这里存在不可纠正的错误,需要全量同步
 	if args.PrevLogIndex < lastSnapshotIndex {
+		reply.Term = cm.currentTerm
+		reply.LeaderId = cm.LeaderId
 		// 设置下一次全量同步(从索引0开始)
 		reply.NextIndex = 0
 		return nil
@@ -314,6 +330,8 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 	// 不在范围内：PrevLogIndex>lastIndex，下一次同步索引取当前的lastIndex+1
 	lastIndex := cm.log.lastIndex()
 	if args.PrevLogIndex > lastIndex {
+		reply.Term = cm.currentTerm
+		reply.LeaderId = cm.LeaderId
 		reply.NextIndex = lastIndex + 1
 		return nil
 	}
@@ -334,6 +352,8 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 				break
 			}
 		}
+		reply.Term = cm.currentTerm
+		reply.LeaderId = cm.LeaderId
 		reply.NextIndex = i + 1
 		return nil
 	}
@@ -372,8 +392,8 @@ func (cm *ConsensusModule) AppendEntries(args AppendEntriesArgs, reply *AppendEn
 		// 通知提交数据
 		cm.newCommitReadyChan <- struct{}{}
 	}
-
-	cm.dlog("AppendEntries reply to Node[%v]: %+v", args.LeaderId, *reply)
+	reply.Term = cm.currentTerm
+	reply.LeaderId = cm.LeaderId
 	return nil
 }
 
@@ -454,7 +474,7 @@ func (cm *ConsensusModule) leaderSendAEs() {
 				cm.mu.Unlock()
 
 				var reply AppendEntriesReply
-				// 获得请求后的内容
+				// 增量复制内容
 				if err := cm.server.Call(peerId, "ConsensusModule.AppendEntries", args, &reply); err == nil {
 					cm.mu.Lock()
 					defer cm.mu.Unlock()
@@ -509,8 +529,10 @@ func (cm *ConsensusModule) leaderSendAEs() {
 						if cm.log.CommitIndex != savedCommitIndex {
 							cm.dlog("leader sets commitIndex := %d", cm.log.CommitIndex)
 							// 通过通道告知已经有日志数据被提交
-							cm.newCommitReadyChan <- struct{}{}
-							cm.triggerAEChan <- struct{}{}
+							go func() {
+								cm.newCommitReadyChan <- struct{}{}
+								cm.triggerAEChan <- struct{}{}
+							}()
 						}
 					} else { // 日志提交失败，需要修改发送日志的位置
 						if reply.NextIndex != -1 {
@@ -541,10 +563,8 @@ type InstallSnapshotReply struct {
 func (cm *ConsensusModule) InstallSnapShot(args InstallSnapshotArgs, reply *InstallSnapshotReply) error {
 	cm.mu.Lock()
 	defer func() {
-		reply.Term = cm.currentTerm
-		reply.LeaderId = cm.LeaderId
-		cm.persist(args.Snapshot)
 		cm.mu.Unlock()
+		cm.persist(args.Snapshot)
 	}()
 	// 死亡节点无需处理
 	if cm.state == Dead {
@@ -574,14 +594,18 @@ func (cm *ConsensusModule) InstallSnapShot(args InstallSnapshotArgs, reply *Inst
 	snapIndex := args.Snapshot.MetaData.Index
 	snapTerm := args.Snapshot.MetaData.Term
 	if snapIndex <= cm.log.CommitIndex {
+		reply.Term = cm.currentTerm
+		reply.LeaderId = cm.LeaderId
 		cm.dlog("Nde[%v] ignored snapshot Index=%v,Term=%v", cm.id, snapIndex, snapTerm)
 		return nil
 	}
 	cm.log.Entries = args.Runtime.Logs
 	cm.log.CommitIndex = args.Runtime.CommitIndex
 	cm.log.Applied = args.Runtime.CommitIndex
-	cm.newCommitReadyChan <- struct{}{}
+	reply.Term = cm.currentTerm
+	reply.LeaderId = cm.LeaderId
 	go func() {
+		cm.newCommitReadyChan <- struct{}{}
 		cm.applyChan <- NewApplyMsgFromSnapshot(args.Snapshot)
 	}()
 	return nil
@@ -613,6 +637,11 @@ func (cm *ConsensusModule) runElectionTimer() {
 	for {
 		<-ticker.C
 		cm.mu.Lock()
+		if cm.server.isStop() {
+			cm.dlog("[Shutdown] in election timer state=%s, bailing out", cm.state)
+			cm.mu.Unlock()
+			return
+		}
 		if cm.state != Candidate && cm.state != Follower {
 			cm.dlog("in election timer state=%s, bailing out", cm.state)
 			cm.mu.Unlock()
@@ -644,7 +673,7 @@ func (cm *ConsensusModule) startElection() {
 	cm.resetElectionEvent()
 	// 投票给自己
 	cm.votedFor = cm.id
-	cm.dlog("becomes Candidate(currentTerm=%d); log=%v", savedCurrentTerm, cm.log)
+	cm.dlog("becomes Candidate(currentTerm=%d); log=%v", savedCurrentTerm, cm.log.GoString())
 	// 已经有了自己的一票
 	voteReceived := 1
 	// 给每个节点发消息拉票
@@ -652,7 +681,7 @@ func (cm *ConsensusModule) startElection() {
 		go func(peerId int) {
 			cm.mu.Lock()
 			// 获得自己的记录状态
-			savedLastLogIndex, savedLastLogTerm := cm.lastLogIndexAndTerm()
+			savedLastLogIndex, savedLastLogTerm := cm.log.lastIndex(), cm.log.lastTerm()
 			cm.mu.Unlock()
 			// 包装请求
 			args := RequestVoteArgs{
@@ -667,9 +696,8 @@ func (cm *ConsensusModule) startElection() {
 			var reply RequestVoteReply
 			if err := cm.server.Call(peerId, "ConsensusModule.RequestVote", args, &reply); err == nil {
 				// 成功获得返回的处理逻辑
-
 				cm.mu.Lock()
-				cm.dlog("received proto.RequestVoteReply %+v", reply)
+				cm.dlog("received RequestVoteReply %+v", reply)
 				// 判断当期节点是否还是Candidate，可能会被其他协程改变，如果不是则不需要走下面的逻辑
 				if cm.state != Candidate {
 					cm.dlog("while waiting for reply, state = %v", cm.state)
@@ -678,7 +706,7 @@ func (cm *ConsensusModule) startElection() {
 				}
 				// 对方任期更大，表示对方数据更新，当前节点不可能当选Leader，转为Follower节点
 				if reply.Term > cm.currentTerm {
-					cm.dlog("term out of date in proto.RequestVoteReply")
+					cm.dlog("term out of date in RequestVoteReply")
 					cm.becomeFollower(reply.Term, reply.LeaderId)
 					cm.mu.Unlock()
 					return
@@ -698,6 +726,8 @@ func (cm *ConsensusModule) startElection() {
 					}
 				}
 				cm.mu.Unlock()
+			} else {
+				cm.dlog("losing connect with Node[%v]", peerId)
 			}
 		}(peerId)
 	}
@@ -707,7 +737,7 @@ func (cm *ConsensusModule) startElection() {
 
 // 成为Follower
 func (cm *ConsensusModule) becomeFollower(term, leaderId int) {
-	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log)
+	cm.dlog("becomes Follower with term=%d; log=%v", term, cm.log.GoString())
 	// 设置节点状态
 	cm.state = Follower
 	cm.LeaderId = leaderId
@@ -775,25 +805,19 @@ func (cm *ConsensusModule) startLeader() {
 				cm.mu.Unlock()
 				// 发送心跳包(日志同步包)
 				cm.leaderSendAEs()
+			} else {
+				cm.dlog("doSend is false")
+				return
 			}
 		}
 	}(50 * time.Millisecond)
 
 }
 
-func (cm *ConsensusModule) lastLogIndexAndTerm() (int, int) {
-	if len(cm.log.Entries) > 0 {
-		lastIndex := len(cm.log.Entries) - 1
-		return lastIndex, cm.log.Entries[lastIndex].Term
-	} else {
-		return -1, -1
-	}
-}
-
 // 数据准备好后发送数据
 func (cm *ConsensusModule) applyChanSender() {
-	// 监听数据Ready channel，通过Ready Channel可以得知是否有数据准备好提交
-	// channel关闭时退出for循环
+	// 发送这关闭通道
+	defer close(cm.applyChan)
 	for range cm.newCommitReadyChan {
 		cm.mu.Lock()
 		// 记录最后一位应用于状态机的索引
@@ -844,7 +868,7 @@ func (cm *ConsensusModule) persistStateAndSnapShot(index int, data []byte) {
 	}
 	// 压缩日志
 	cm.log.compact(snapShot.MetaData.Index)
-	cm.persist(snapShot)
+	go cm.persist(snapShot)
 	return
 }
 
@@ -856,6 +880,6 @@ func (cm *ConsensusModule) persistSnapShot(snap *SnapShot) {
 	}
 	// 压缩日志
 	cm.log.compact(snap.MetaData.Index)
-	cm.persist(snap)
+	go cm.persist(snap)
 	return
 }

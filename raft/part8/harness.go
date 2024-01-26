@@ -65,10 +65,11 @@ type Harness struct {
 // NewHarness 新建辅助对象
 func NewHarness(t *testing.T, n int) *Harness {
 	// 初始化
+	os.Setenv("RaftServerTest", "true")
 	ns := make([]*Server, n)
 	connected := make([]bool, n)
 	alive := make([]bool, n)
-	commitChans := make([]chan ApplyMsg, n)
+	//commitChans := make([]chan ApplyMsg, n)
 	commits := make([][]ApplyMsg, n)
 	storage := make([]*Storage, n)
 	timestamp := time.Now().Format("2006-01-02_15-04-05.000")
@@ -87,7 +88,7 @@ func NewHarness(t *testing.T, n int) *Harness {
 		if err != nil {
 			tlog("NewStorage err:%v", err)
 		}
-		commitChans[i] = make(chan ApplyMsg)
+		//commitChans[i] = make(chan ApplyMsg)
 		// 新建raft服务器
 		ns[i] = NewServer(i, GetEndpoint(i), peerIds, storage[i])
 		// 启动raft服务
@@ -108,18 +109,14 @@ func NewHarness(t *testing.T, n int) *Harness {
 	// 告知监听ready channel的协程已经准备好了
 	// 统统装入Harness中
 	h := &Harness{
-		cluster:     ns,
-		storage:     storage,
-		commitChans: commitChans,
-		commits:     commits,
-		connected:   connected,
-		alive:       alive,
-		n:           n,
-		t:           t,
-	}
-	// 开启收集已提交数据的协程
-	for i := 0; i < n; i++ {
-		go h.collectCommits(i)
+		cluster: ns,
+		storage: storage,
+		//commitChans: commitChans,
+		commits:   commits,
+		connected: connected,
+		alive:     alive,
+		n:         n,
+		t:         t,
 	}
 	return h
 }
@@ -134,12 +131,10 @@ func (h *Harness) Shutdown() {
 	}
 	for i := 0; i < h.n; i++ {
 		if h.alive[i] {
+			tlog("Node[%v] is Shutdown ####################################################################", i)
 			h.alive[i] = false
 			h.cluster[i].Shutdown()
 		}
-	}
-	for i := 0; i < h.n; i++ {
-		close(h.commitChans[i])
 	}
 }
 
@@ -179,11 +174,6 @@ func (h *Harness) CrashPeer(id int) {
 	h.alive[id] = false
 	// 关机
 	h.cluster[id].Shutdown()
-
-	h.mu.Lock()
-	// 数据清零
-	h.commits[id] = h.commits[id][:0]
-	h.mu.Unlock()
 }
 
 // RestartPeer 重启节点
@@ -362,14 +352,4 @@ func tlog(format string, a ...interface{}) {
 // 睡眠函数
 func sleepMs(n int) {
 	time.Sleep(time.Duration(n) * time.Millisecond)
-}
-
-// 收集已提交的数据到commits中
-func (h *Harness) collectCommits(i int) {
-	for c := range h.commitChans[i] {
-		h.mu.Lock()
-		tlog("collectCommits(%d) got %+v", i, c)
-		h.commits[i] = append(h.commits[i], c)
-		h.mu.Unlock()
-	}
 }

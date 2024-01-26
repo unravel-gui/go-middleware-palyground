@@ -9,203 +9,6 @@ import (
 	"github.com/fortytw2/leaktest"
 )
 
-func TestBasicPut(t *testing.T) {
-	h := NewHarness(t, 3)
-	defer h.Shutdown()
-	serverId, _ := h.CheckSingleLeader()
-	var reply CommandReply
-	key := "test"
-	value := "success"
-	h.cluster[serverId].Put(key, value, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	value2 := "duplicate data"
-	h.cluster[serverId].Put(key, value2, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	h.CheckSingleLeader()
-}
-
-func TestBasicGet(t *testing.T) {
-	h := NewHarness(t, 3)
-	defer h.Shutdown()
-	serverId, _ := h.CheckSingleLeader()
-
-	var reply CommandReply
-	h.cluster[serverId].Get("no_existed_key", &reply)
-	if reply.CmdStatus != NO_KEY {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-
-	key := "test"
-	value := "success"
-	ok := h.Put(serverId, key, value)
-	if !ok {
-		t.Errorf("mock put one kv err")
-	}
-	reply = CommandReply{}
-	h.cluster[serverId].Get(key, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.Value != value {
-		t.Fatalf("want value= %v but got %v", value, reply.Value)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	h.CheckSingleLeader()
-}
-
-func TestBasicDelete(t *testing.T) {
-	h := NewHarness(t, 3)
-	defer h.Shutdown()
-	serverId, _ := h.CheckSingleLeader()
-	var reply CommandReply
-	h.cluster[serverId].Delete("no_existed_key", &reply)
-	if reply.CmdStatus != NO_KEY {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-
-	key := "test"
-	value := "success"
-	ok := h.Put(serverId, key, value)
-	if !ok {
-		t.Errorf("mock put one kv err")
-	}
-	_, ok = h.cluster[serverId].GetForTest(key)
-	if !ok {
-		t.Errorf("mock put one kv err")
-	}
-	reply = CommandReply{}
-	h.cluster[serverId].Delete(key, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	v, ok := h.cluster[serverId].GetForTest(key)
-	if ok {
-		t.Errorf("delete err, got %v, want none", v)
-	}
-}
-
-func TestComplexOp(t *testing.T) {
-	h := NewHarness(t, 3)
-	defer h.Shutdown()
-	serverId, _ := h.CheckSingleLeader()
-
-	// get no_existed_key
-	noExistKey := "no_existed_key"
-	var reply CommandReply
-	h.cluster[serverId].Get(noExistKey, &reply)
-	if reply.CmdStatus != NO_KEY {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-
-	// delete no_existed_key
-	reply = CommandReply{}
-	h.cluster[serverId].Delete(noExistKey, &reply)
-	if reply.CmdStatus != NO_KEY {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-
-	value := "success"
-	reply = CommandReply{}
-	// put no_existed_key
-	h.cluster[serverId].Put(noExistKey, value, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	// put another key
-	key := "test"
-	reply = CommandReply{}
-	h.cluster[serverId].Put(key, value, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	// get key
-	reply = CommandReply{}
-	h.cluster[serverId].Get(key, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.Value != value {
-		t.Fatalf("want value= %v but got %v", value, reply.Value)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	// put duplicate key
-	value2 := "duplicate data"
-	reply = CommandReply{}
-	h.cluster[serverId].Put(key, value2, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	// get again
-	reply = CommandReply{}
-	h.cluster[serverId].Get(key, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.Value != value2 {
-		t.Fatalf("want value= %v but got %v", value2, reply.Value)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	// delete key
-	reply = CommandReply{}
-	h.cluster[serverId].Delete(key, &reply)
-	if reply.CmdStatus != OK {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-	// get key after delete
-	reply = CommandReply{}
-	h.cluster[serverId].Get(key, &reply)
-	if reply.CmdStatus != NO_KEY {
-		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
-	}
-	if reply.LeaderId != serverId {
-		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
-	}
-
-}
-
 // 测试基本运行
 func TestElectionBasic(t *testing.T) {
 	h := NewHarness(t, 3)
@@ -856,4 +659,202 @@ func TestCrashAfterSubmit(t *testing.T) {
 	sleepMs(250)
 	h.CheckCommittedN(5, 3)
 	h.CheckCommittedN(6, 3)
+}
+
+func TestBasicPut(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+	var reply CommandReply
+	key := "test"
+	value := "success"
+	h.cluster[serverId].Put(key, value, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	value2 := "duplicate data"
+	h.cluster[serverId].Put(key, value2, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	h.CheckSingleLeader()
+}
+
+func TestBasicGet(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+
+	var reply CommandReply
+	h.cluster[serverId].Get("no_existed_key", &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	key := "test"
+	value := "success"
+	ok := h.Put(serverId, key, value)
+	if !ok {
+		t.Errorf("mock put one kv err")
+	}
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.Value != value {
+		t.Fatalf("want value= %v but got %v", value, reply.Value)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	h.CheckSingleLeader()
+}
+
+func TestBasicDelete(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+	var reply CommandReply
+	h.cluster[serverId].Delete("no_existed_key", &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	key := "test"
+	value := "success"
+	ok := h.Put(serverId, key, value)
+	if !ok {
+		t.Errorf("mock put one kv err")
+	}
+	_, ok = h.cluster[serverId].GetForTest(key)
+	if !ok {
+		t.Errorf("mock put one kv err")
+	}
+	reply = CommandReply{}
+	h.cluster[serverId].Delete(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	v, ok := h.cluster[serverId].GetForTest(key)
+	if ok {
+		t.Errorf("delete err, got %v, want none", v)
+	}
+}
+
+func TestComplexOp(t *testing.T) {
+	h := NewHarness(t, 3)
+	defer leaktest.CheckTimeout(t, 100*time.Millisecond)()
+	defer h.Shutdown()
+	serverId, _ := h.CheckSingleLeader()
+
+	// get no_existed_key
+	noExistKey := "no_existed_key"
+	var reply CommandReply
+	h.cluster[serverId].Get(noExistKey, &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	// delete no_existed_key
+	reply = CommandReply{}
+	h.cluster[serverId].Delete(noExistKey, &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
+	value := "success"
+	reply = CommandReply{}
+	// put no_existed_key
+	h.cluster[serverId].Put(noExistKey, value, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// put another key
+	key := "test"
+	reply = CommandReply{}
+	h.cluster[serverId].Put(key, value, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// get key
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.Value != value {
+		t.Fatalf("want value= %v but got %v", value, reply.Value)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// put duplicate key
+	value2 := "duplicate data"
+	reply = CommandReply{}
+	h.cluster[serverId].Put(key, value2, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// get again
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.Value != value2 {
+		t.Fatalf("want value= %v but got %v", value2, reply.Value)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// delete key
+	reply = CommandReply{}
+	h.cluster[serverId].Delete(key, &reply)
+	if reply.CmdStatus != OK {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+	// get key after delete
+	reply = CommandReply{}
+	h.cluster[serverId].Get(key, &reply)
+	if reply.CmdStatus != NO_KEY {
+		t.Fatalf("want CmdStatus= %v but got %v, reply=%+v", OK.String(), reply.CmdStatus.String(), reply)
+	}
+	if reply.LeaderId != serverId {
+		t.Fatalf("want leaderId= %v but got %v", serverId, reply.LeaderId)
+	}
+
 }

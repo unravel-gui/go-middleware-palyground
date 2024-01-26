@@ -16,8 +16,8 @@ type RaftLog struct {
 
 func (rl *RaftLog) GoString() string {
 	// 使用 fmt.Sprintf 格式化 RaftLog 的字符串表示
-	return fmt.Sprintf("RaftLog{Entries: %+v, CommitIndex: %d, Applied: %d}",
-		rl.Entries, rl.CommitIndex, rl.Applied)
+	return fmt.Sprintf("RaftLog{lastSnapShotIndex: %+v,lastIndex=%v, CommitIndex: %d, Applied: %d}",
+		rl.lastSnapshotIndex(), rl.lastIndex(), rl.CommitIndex, rl.Applied)
 }
 
 func NewRaftLog(storage *Storage, maxNextEntriesSize int) *RaftLog {
